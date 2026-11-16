@@ -204,7 +204,8 @@ def attribute(commits: list[tuple[str, str]] | None, *other: tuple[str, str | No
     when they could not be determined. `other` are (source, text) pairs that describe the whole
     revision, such as the author login.
 
-      <agent>   every commit carries that agent's marker, or the revision as a whole does
+      <agent>   every commit carries that agent's marker, or no commit is marked and the
+                revision as a whole (login, description) is
       mixed     more than one agent, or some commits marked and others not
       unmarked  no marker anywhere (this does not prove a human wrote it)
       unknown   the revision's commits could not be determined
@@ -223,6 +224,9 @@ def attribute(commits: list[tuple[str, str]] | None, *other: tuple[str, str | No
     agents = whole | {a for a in per_commit if a != "unmarked"}
     if not agents:
         return "unmarked", evidence
-    if len(agents) > 1 or (not whole and "unmarked" in per_commit):
+    # Commit-level evidence decides whether a revision is mixed. A marker in the description or
+    # login is supplementary: it cannot vouch for commits that carry no marker of their own.
+    partly_marked = "unmarked" in per_commit and any(a != "unmarked" for a in per_commit)
+    if len(agents) > 1 or partly_marked:
         return "mixed", evidence
     return agents.pop(), evidence

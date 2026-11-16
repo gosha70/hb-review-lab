@@ -291,6 +291,11 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(common.attribute([fix])[0], "claude")
         self.assertEqual(common.attribute([human], ("author_login", "copilot-swe-agent[bot]"))[0], "copilot")
         self.assertEqual(common.attribute(None, ("author_login", "alice"))[0], "unknown")
+        # a marker in the PR description does not override mixed commit-level authorship
+        desc = ("pr_description", "Generated with Claude Code")
+        self.assertEqual(common.attribute([human, fix], desc)[0], "mixed")
+        self.assertEqual(common.attribute([human], desc)[0], "claude")     # no commit marked: description stands
+        self.assertEqual(common.attribute([fix], desc)[0], "claude")
         mk = lambda w: {"case_id": w, "date": "2026", "written_by": w}
         chosen = label_second_teacher.select([mk("claude"), mk("mixed"), mk("unknown"), mk("unmarked")], control=5)
         self.assertEqual([c["case_id"] for c in chosen], ["claude", "unmarked"])
@@ -323,6 +328,15 @@ class PipelineTest(unittest.TestCase):
             rep = json.load(open(f"{d}/r.json"))["x"]
             self.assertEqual((rep["changes"], rep["changes_scored"]), (2, 1))
             self.assertIn("1 changes have an incomplete diff (unreadable_file: 1)", open(f"{d}/r.md").read())
+
+            # a test set with only unreadable changes still gets a coverage report
+            common.write_jsonl(f"{d}/only.jsonl", [b])
+            common.write_jsonl(f"{d}/empty.jsonl", [])
+            evaluate.main(["report", f"x={d}/p.jsonl", "--data", f"{d}/empty.jsonl",
+                           "--changes", f"{d}/only.jsonl", "--out", f"{d}/r2"])
+            r2 = json.load(open(f"{d}/r2.json"))["x"]
+            self.assertEqual((r2["changes"], r2["changes_scored"], r2["units"]), (1, 0, 0))
+            self.assertIn("1 changes have an incomplete diff (unreadable_file: 1)", open(f"{d}/r2.md").read())
 
     def test_normalise_answers(self):
         q = common.load_questions()

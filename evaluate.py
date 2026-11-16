@@ -245,9 +245,9 @@ def fmt(x, pct=False) -> str:
 def cmd_report(args) -> int:
     units = read_jsonl(args.data)
     changes = read_jsonl(args.changes)
-    if not units:
-        sys.exit(f"No rows in {args.data}")
-    questions = units[0]["questions"]
+    # With no units at all (a test set of only unreadable changes) there is nothing to score,
+    # but the coverage section still shows that every change requires escalation.
+    questions = units[0]["questions"] if units else load_questions()
     preds = {}
     for spec in args.predictions:
         name, _, path = spec.partition("=")

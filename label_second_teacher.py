@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Second teacher: label a subset of changes with an OpenAI model, to check the first teacher.
+"""Second teacher: label a subset of changes with an OpenAI model, as a potential-bias screen.
 
 An LLM judge can favour output from its own model family. The first teacher is Claude, so the
-changes written by AI agents (and a control group of unmarked ones) are labelled again by a
-model from another provider, with the same rubric, prompt and answer schema. Compare the two:
+changes attributed to an AI agent (and a group of unmarked ones) are labelled again by a model
+from another provider, with the same rubric, prompt and answer schema.
+
+This is a teacher-disagreement screen. It cannot establish self-preference: disagreement may
+reflect ordinary model differences, and the unmarked group is the newest unmarked changes, not
+cases matched by repository, date, size or risk. Changes whose authorship is `mixed` or
+`unknown` are left out. Compare the two teachers with:
 
     pip install openai
     export OPENAI_API_KEY=...
@@ -25,8 +30,8 @@ from label_changes import SYSTEM, parse, prompt, rubric, schema
 
 
 def select(cases: list[dict], control: int) -> list[dict]:
-    """Every AI-written change, plus the newest `control` unmarked ones for comparison."""
-    ai = [c for c in cases if c.get("written_by", "unmarked") != "unmarked"]
+    """Every change attributed to one AI agent, plus the newest `control` unmarked ones."""
+    ai = [c for c in cases if c.get("written_by", "unmarked") not in ("unmarked", "mixed", "unknown")]
     rest = sorted((c for c in cases if c.get("written_by", "unmarked") == "unmarked"),
                   key=lambda c: c["date"], reverse=True)
     return ai + rest[:control]

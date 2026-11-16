@@ -195,3 +195,34 @@ def written_by(*texts: str | None) -> str:
         if rx.search(blob):
             return agent
     return "unmarked"
+
+
+def attribute(commits: list[tuple[str, str]] | None, *other: tuple[str, str | None]) -> tuple[str, list[dict]]:
+    """Who wrote one revision of a change. Returns (label, evidence).
+
+    `commits` are the (sha, message) pairs that make up the revision being classified, or None
+    when they could not be determined. `other` are (source, text) pairs that describe the whole
+    revision, such as the author login.
+
+      <agent>   every commit carries that agent's marker, or the revision as a whole does
+      mixed     more than one agent, or some commits marked and others not
+      unmarked  no marker anywhere (this does not prove a human wrote it)
+      unknown   the revision's commits could not be determined
+    """
+    evidence = []
+    for source, text in other:
+        agent = written_by(text)
+        if agent != "unmarked":
+            evidence.append({"source": source, "agent": agent})
+    whole = {e["agent"] for e in evidence}
+    if commits is None:
+        return "unknown", evidence
+    per_commit = [written_by(msg) for _, msg in commits]
+    evidence += [{"source": f"commit:{sha[:7]}", "agent": a}
+                 for (sha, _), a in zip(commits, per_commit) if a != "unmarked"]
+    agents = whole | {a for a in per_commit if a != "unmarked"}
+    if not agents:
+        return "unmarked", evidence
+    if len(agents) > 1 or (not whole and "unmarked" in per_commit):
+        return "mixed", evidence
+    return agents.pop(), evidence

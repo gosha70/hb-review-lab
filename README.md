@@ -50,8 +50,12 @@ How the data is shaped:
   `external_allowlist.json` names, per provider, the exact repositories whose code may be sent.
   Anything not listed stays local. Every case sent is logged to a `.sent.jsonl` file. Secret
   redaction covers common key formats only; treat it as a safety net.
-- Each case records `written_by`: the AI coding agent named in commit trailers or PR text, or
-  `unmarked` when there is no marker (which does not prove a human wrote it).
+- Each case records `written_by` for the revision being classified: an AI coding agent named
+  in its commit trailers, `mixed` when only some commits are marked or agents differ,
+  `unmarked` when there is no marker (which does not prove a human wrote it), or `unknown`
+  when the revision's commits could not be determined. `written_by_evidence` lists the markers.
+- A change with no readable diff at all (binary-only, for example) is kept as an incomplete
+  case with no units, so it appears in coverage and escalation counts.
 - Labels are `label_source: "inferred"`: the teacher's judgement, not human-validated.
 
 ## 2. Train Laya on the DGX Spark
@@ -95,10 +99,11 @@ inputs no backend truncated. Changes with an incomplete diff or a truncated inpu
 separately as requiring escalation and are never scored as classified. When the test set mixes
 AI-written and unmarked changes, the report also breaks the results down by author.
 
-### Checking the teacher
+### Screening the teacher for potential bias
 
-An LLM judge can favour output from its own model family, and the first teacher is Claude. To
-check, label the AI-written changes and a control group again with an OpenAI model and compare:
+An LLM judge can favour output from its own model family, and the first teacher is Claude. As a
+screen, label the AI-attributed changes and a group of unmarked ones again with an OpenAI model
+and compare:
 
 ```bash
 pip install openai
@@ -108,7 +113,9 @@ python evaluate.py teachers claude=data/labels.jsonl openai=data/labels.openai.j
 ```
 
 If Claude answers lower than the second teacher more often on Claude-written changes than on
-unmarked ones, its labels for AI-written code are suspect.
+unmarked ones, that is a reason to look closer. It is not proof of self-preference: the gap can
+come from ordinary model differences, and the two groups are not matched by repository, date,
+size or risk. Confirming it needs matched cases and independently reviewed labels.
 
 ## Tests
 

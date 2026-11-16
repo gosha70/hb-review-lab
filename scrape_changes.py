@@ -26,9 +26,10 @@ import urllib.error
 from collections import defaultdict
 
 import repo_audit as gh
-from common import append_jsonl, read_jsonl, redact, written_by
+from common import attribute, append_jsonl, read_jsonl, redact, written_by
 
 MAX_FILE_PAGES = 3  # 300 files
+PR_COMMIT_CAP = 250   # GitHub lists at most this many commits for a pull request
 SINGLE_CALL_FILE_CAP = 300  # compare and commit endpoints return at most this many files
 
 
@@ -65,7 +66,6 @@ def scrape_pr(token: str, c: dict) -> dict:
     reviews = paged(token, f"/repos/{repo}/pulls/{n}/reviews")
     comments = paged(token, f"/repos/{repo}/pulls/{n}/comments")
     commits = paged(token, f"/repos/{repo}/pulls/{n}/commits", 3)
-    author = written_by(c["author"], pr.get("body"), *[k["commit"]["message"] for k in commits])
 
     def human(u):
         return u and u.get("type") != "Bot" and u.get("login") != c["author"]
@@ -96,9 +96,19 @@ def scrape_pr(token: str, c: dict) -> dict:
     if first and edited and edited > (first.get("submitted_at") or ""):
         body, body_source = "", "omitted_edited_after_first_review"
 
+    # Authorship is attributed to the revision being classified. For a first-review snapshot
+    # that is the commits up to the reviewed one, so a later AI-written fix does not count.
+    revision = [(k["sha"], k["commit"]["message"]) for k in commits]
+    if len(commits) >= PR_COMMIT_CAP:
+        revision = None
+    elif source == "at_first_review":
+        shas = [sha for sha, _ in revision]
+        revision = revision[:shas.index(first["commit_id"]) + 1] if first["commit_id"] in shas else None
+    author, evidence = attribute(revision, ("author_login", c["author"]), ("pr_description", body))
+
     return {
         "body": redact(body), "body_source": body_source, "files": files, "diff_source": source,
-        "files_complete": files_complete, "written_by": author,
+        "files_complete": files_complete, "written_by": author, "written_by_evidence": evidence,
         "outcome": {
             "observed": c["observed"],
             "reviews": [{"state": r["state"], "author": (r.get("user") or {}).get("login"),
@@ -116,11 +126,12 @@ def scrape_commit(token: str, c: dict) -> dict:
     d = get(token, f"/repos/{c['repo']}/commits/{c['id']}")
     message = d["commit"]["message"]
     body = message.split("\n", 1)[1].strip() if "\n" in message else ""
+    author, evidence = attribute([(c["id"], message)], ("author_login", c["author"]))
     return {
         "body": redact(body), "body_source": "current",
         "files": files_of(d.get("files", [])), "diff_source": "final",
         "files_complete": len(d.get("files", [])) < SINGLE_CALL_FILE_CAP,
-        "written_by": written_by(c["author"], message),
+        "written_by": author, "written_by_evidence": evidence,
         "outcome": {"observed": c["observed"], "reviews": [], "review_comments": []},
     }
 
@@ -157,7 +168,7 @@ def main(argv=None) -> int:
     todo = [c for c in select(read_jsonl(args.candidates), args.max_per_repo, args.include_unmerged)
             if case_id(c) not in done]
     gh.log(f"{len(done)} cases already scraped, {len(todo)} to fetch")
-    written = skipped = 0
+    written = skipped = unreadable = 0
     for i, c in enumerate(todo, 1):
         try:
             detail = scrape_pr(token, c) if c["kind"] == "pr" else scrape_commit(token, c)
@@ -165,9 +176,9 @@ def main(argv=None) -> int:
             gh.log(f"  skipped {case_id(c)}: {e}")
             skipped += 1
             continue
-        if not any(f["patch"] for f in detail["files"]):
-            skipped += 1     # nothing textual to classify
-            continue
+        # A change with no readable diff (binary-only, for example) is kept. It yields no units,
+        # so downstream it is an incomplete case that requires escalation, not a missing one.
+        unreadable += not any(f["patch"] for f in detail["files"])
         append_jsonl(args.out, {
             "case_id": case_id(c), "repo": c["repo"], "kind": c["kind"], "id": c["id"],
             "date": c["date"], "title": redact(c["title"]), "author": c["author"],
@@ -176,7 +187,7 @@ def main(argv=None) -> int:
         written += 1
         if i % 50 == 0:
             gh.log(f"  {i}/{len(todo)}")
-    gh.log(f"Wrote {written} cases to {args.out}; skipped {skipped}")
+    gh.log(f"Wrote {written} cases to {args.out} ({unreadable} with no readable diff); skipped {skipped}")
     return 0
 
 

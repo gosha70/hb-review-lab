@@ -221,6 +221,10 @@ def main(argv=None) -> int:
     if blocked:
         log(f"Not on the anthropic allowlist, will not be sent: {', '.join(blocked)}")
     todo = [c for k, c in cases.items() if k not in done and c["repo"] in allowed]
+    no_text = [c for c in todo if not build_units(c, args.unit_chars, args.max_units)[0]]
+    if no_text:
+        log(f"{len(no_text)} changes have no readable diff; not sent. They stay in the dataset as incomplete.")
+    todo = [c for c in todo if c not in no_text]
     if args.limit:
         todo = todo[:args.limit]
     log(f"{len(done)} cases already labelled, {len(todo)} to label with {args.model}")

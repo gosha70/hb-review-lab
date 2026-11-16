@@ -44,11 +44,15 @@ class FakeGitHub(BaseHTTPRequestHandler):
             body = [{"path": "src/auth.py", "line": 2, "user": {"login": "bob", "type": "User"},
                      "body": "hard-coded token"}]
         elif p.endswith("/pulls/1/commits"):
-            body = [{"commit": {"message": "Add login\n\nCo-Authored-By: Claude <noreply@anthropic.com>"}}]
+            # reviewed at commit f; a human pushed a follow-up afterwards
+            body = [{"sha": "f" * 40, "commit": {"message": "Add login\n\nCo-Authored-By: Claude <noreply@anthropic.com>"}},
+                    {"sha": "9" * 40, "commit": {"message": "Address review by hand"}}]
         elif "/compare/" in p:
             body = {"files": f}
         elif p.endswith("/files"):
             body = f
+        elif "/commits/" + "b" * 40 in p:
+            body = {"commit": {"message": "Replace logo"}, "files": f[1:]}      # binary only
         elif "/commits/" in p:
             body = {"commit": {"message": "Tweak\n\nbody text"}, "files": f[:1]}
         else:
@@ -167,7 +171,9 @@ class PipelineTest(unittest.TestCase):
             # the snapshot's binary file is what makes it incomplete
             self.assertTrue(pr["files_complete"])
             self.assertEqual(common.build_units(pr)[1], ["unreadable_file"])
+            # authorship covers the reviewed snapshot (commit f), not the later human commit
             self.assertEqual(pr["written_by"], "claude")
+            self.assertEqual(pr["written_by_evidence"], [{"source": "commit:fffffff", "agent": "claude"}])
             self.assertEqual({c["written_by"] for c in cases if c["kind"] == "commit"}, {"unmarked"})
             self.assertNotIn("abcdefgh12345678", pr["files"][0]["patch"])
             self.assertEqual(pr["outcome"]["review_comments"][0]["body"], "hard-coded token")
@@ -272,6 +278,51 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(r4["b"]["changes_truncated"], 0)
             self.assertIsNone(r4["t"]["questions"]["security_review"]["unit_accuracy"])  # truncated unit excluded
             self.assertIn("1 complete changes had a unit that a backend truncated", open(f"{d}/report4.md").read())
+
+    def test_authorship_is_scoped_to_the_revision(self):
+        claude = "Fix\n\nCo-Authored-By: Claude <noreply@anthropic.com>"
+        human, fix = ("a" * 40, "Implement feature"), ("b" * 40, claude)
+        # human implementation reviewed first; Claude's fix came after the snapshot
+        self.assertEqual(common.attribute([human])[0], "unmarked")
+        # the same PR taken whole is mixed, not "claude"
+        label, evidence = common.attribute([human, fix])
+        self.assertEqual((label, evidence), ("mixed", [{"source": "commit:bbbbbbb", "agent": "claude"}]))
+        self.assertEqual(common.attribute([fix, ("c" * 40, "x\n\nCo-authored-by: Copilot <c@x>")])[0], "mixed")
+        self.assertEqual(common.attribute([fix])[0], "claude")
+        self.assertEqual(common.attribute([human], ("author_login", "copilot-swe-agent[bot]"))[0], "copilot")
+        self.assertEqual(common.attribute(None, ("author_login", "alice"))[0], "unknown")
+        mk = lambda w: {"case_id": w, "date": "2026", "written_by": w}
+        chosen = label_second_teacher.select([mk("claude"), mk("mixed"), mk("unknown"), mk("unmarked")], control=5)
+        self.assertEqual([c["case_id"] for c in chosen], ["claude", "unmarked"])
+
+    def test_binary_only_change_is_kept_and_escalated(self):
+        questions = common.load_questions()
+        with tempfile.TemporaryDirectory() as d:
+            common.write_jsonl(f"{d}/cand.jsonl", [cand("commit", "b" * 40, "2026-02-01T00:00:00Z"),
+                                                    cand("commit", "c" * 40, "2026-03-01T00:00:00Z")])
+            self.scrape.main(["--candidates", f"{d}/cand.jsonl", "--out", f"{d}/cases.jsonl"])
+            cases = {c["case_id"]: c for c in common.read_jsonl(f"{d}/cases.jsonl")}
+            binary, normal = cases["me/app@" + "b" * 12], cases["me/app@" + "c" * 12]
+            self.assertEqual(common.build_units(binary), ([], ["unreadable_file"]))   # kept, with no units
+            units, _ = common.build_units(normal)
+            common.append_jsonl(f"{d}/labels.jsonl", {
+                "case_id": normal["case_id"], "unit_chars": 1800, "max_units": 40,
+                **label_changes.parse(teacher_answer(units), normal, questions, 1800, 40)})
+            build_dataset.main(["--cases", f"{d}/cases.jsonl", "--labels", f"{d}/labels.jsonl", "--out", d,
+                                "--holdout-repo", "me/app"])
+            tc = {c["case_id"]: c for c in common.read_jsonl(f"{d}/test_changes.jsonl")}
+            b = tc[binary["case_id"]]
+            self.assertEqual((b["units"], b["units_complete"], b["incomplete_reasons"], b["unread_files"]),
+                             ([], False, ["unreadable_file"], ["logo.png"]))
+            test = common.read_jsonl(f"{d}/test.jsonl")
+            for r in test:
+                common.append_jsonl(f"{d}/p.jsonl", {"id": r["id"], "ms": 1.0, "answers": {
+                    q: {"label": v, "p": 0.9} for q, v in r["expected"].items()}})
+            evaluate.main(["report", f"x={d}/p.jsonl", "--data", f"{d}/test.jsonl",
+                           "--changes", f"{d}/test_changes.jsonl", "--out", f"{d}/r"])
+            rep = json.load(open(f"{d}/r.json"))["x"]
+            self.assertEqual((rep["changes"], rep["changes_scored"]), (2, 1))
+            self.assertIn("1 changes have an incomplete diff (unreadable_file: 1)", open(f"{d}/r.md").read())
 
     def test_normalise_answers(self):
         q = common.load_questions()

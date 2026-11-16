@@ -11,7 +11,7 @@
     # Side-by-side report
     python evaluate.py report laya=out/pred.laya.jsonl jev=out/pred.jev.jsonl --out out/report
 
-    # Do two teachers label the same changes differently? (see label_second_teacher.py)
+    # Teacher-disagreement screen for potential bias (see label_second_teacher.py)
     python evaluate.py teachers claude=data/labels.jsonl openai=data/labels.openai.jsonl
 
 Every backend answers the same unit inputs with the same questions. A change-level answer is
@@ -199,7 +199,10 @@ def change_metrics(preds: dict, group: list[dict], qid: str, q: dict) -> dict:
 
 
 def cmd_teachers(args) -> int:
-    """Where two teachers disagree, and in which direction, split by who wrote the change."""
+    """Where two teachers disagree, and in which direction, split by who wrote the change.
+
+    A screen for potential bias, not proof of it: the author groups are not matched.
+    """
     questions = load_questions(args.questions)
     (na, pa), (nb, pb) = (s.partition("=")[::2] for s in (args.a, args.b))
     la = {r["case_id"]: r["change"] for r in read_jsonl(pa)}
@@ -208,7 +211,11 @@ def cmd_teachers(args) -> int:
     both = sorted(set(la) & set(lb))
     if not both:
         sys.exit("The two label files share no cases.")
-    md = ["# Teacher disagreement", "",
+    md = ["# Teacher disagreement (potential-bias screen)", "",
+          "This shows where two teachers disagree and in which direction. It is a screen, not a test "
+          "of self-preference: a gap can also come from ordinary differences between the models or "
+          "between the groups of changes, which are not matched. Confirming bias needs matched cases "
+          "and independently reviewed labels.", "",
           f"{len(both)} changes labelled by both {na} and {nb}.",
           f"'{na} lower' means {na} chose a less severe answer than {nb} for the same change.", "",
           f"| Question | Written by | Changes | Agree | {na} lower | {na} higher |", "|---|---|---|---|---|---|"]
@@ -238,6 +245,8 @@ def fmt(x, pct=False) -> str:
 def cmd_report(args) -> int:
     units = read_jsonl(args.data)
     changes = read_jsonl(args.changes)
+    if not units:
+        sys.exit(f"No rows in {args.data}")
     questions = units[0]["questions"]
     preds = {}
     for spec in args.predictions:

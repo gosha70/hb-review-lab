@@ -23,7 +23,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from common import build_units, load_questions, read_jsonl, unread_files, write_jsonl
+from common import MAX_UNITS, UNIT_CHARS, build_units, load_questions, read_jsonl, unread_files, write_jsonl
 
 
 def split(cases: list[dict], val_frac: float, test_frac: float, holdout: set[str]):
@@ -67,8 +67,20 @@ def main(argv=None) -> int:
 
     questions = load_questions(args.questions)
     labels = {l["case_id"]: l for l in read_jsonl(args.labels)}
-    cases = [c for c in read_jsonl(args.cases) if c["case_id"] in labels]
-    if not cases:
+    # A change with no readable diff has no units and so no teacher labels. It is kept as an
+    # incomplete case so it shows up in coverage and escalation counts.
+    cases = []
+    for c in read_jsonl(args.cases):
+        if c["case_id"] in labels:
+            cases.append(c)
+        else:
+            units, reasons = build_units(c)
+            if not units:
+                labels[c["case_id"]] = {"change": None, "units": {}, "unit_chars": UNIT_CHARS,
+                                        "max_units": MAX_UNITS, "units_complete": False,
+                                        "incomplete_reasons": reasons or ["no_readable_diff"]}
+                cases.append(c)
+    if not any(labels[c["case_id"]]["change"] for c in cases):
         sys.exit("No labelled cases. Run scrape_changes.py and label_changes.py first.")
     train, val, test = split(cases, args.val_frac, args.test_frac, set(args.holdout_repo))
 
@@ -93,10 +105,11 @@ def main(argv=None) -> int:
     print(f"train: {len(train)} changes, {len(train_rows)} units")
     print(f"val:   {len(val)} changes, {len(val_rows)} units")
     print(f"test:  {len(test)} changes, {len(test_rows)} units "
-          f"({sum(not labels[c['case_id']]['units_complete'] for c in test)} incomplete)")
+          f"({sum(not labels[c['case_id']]['units_complete'] for c in test)} incomplete, "
+          f"{sum(not labels[c['case_id']]['change'] for c in test)} of them with no readable diff)")
     for qid in questions:
         tr = Counter(str(r["expected"][qid]) for r in train_rows)
-        te = Counter(str(labels[c["case_id"]]["change"][qid]) for c in test)
+        te = Counter(str(labels[c["case_id"]]["change"][qid]) for c in test if labels[c["case_id"]]["change"])
         print(f"  {qid}: train units {dict(sorted(tr.items()))} | test changes {dict(sorted(te.items()))}")
     return 0
 

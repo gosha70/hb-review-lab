@@ -16,7 +16,7 @@ import evaluate
 import label_changes
 import label_second_teacher
 
-PATCH = "@@ -1,2 +1,3 @@\n context\n+token = 'abcdefgh12345678'\n" + "@@ -9,1 +10,2 @@\n+more\n" * 3
+PATCH = "@@ -1,2 +1,3 @@\n context\n+token = 'abcdefgh12345678'\n" + "@@ -9,1 +10,2 @@\n+more\n" * 30
 OBS = {"human_reviews": 1, "human_inline_comments": 1, "changes_requested": True, "bot_reviews": 0,
        "discussion_comments": 0, "ci_failed": False, "reverted": False, "is_revert": False, "is_fix": False}
 
@@ -28,11 +28,14 @@ def cand(kind, id_, date, **kw):
 
 
 class FakeGitHub(BaseHTTPRequestHandler):
+    requests = []
+
     def log_message(self, *a):
         pass
 
     def do_GET(self):
         p = self.path.split("?")[0]
+        FakeGitHub.requests.append(p)
         f = [{"filename": "src/auth.py", "status": "modified", "additions": 4, "deletions": 0, "patch": PATCH},
              {"filename": "logo.png", "status": "added", "additions": 0, "deletions": 0}]
         if p.endswith("/pulls/1"):
@@ -98,21 +101,81 @@ class PipelineTest(unittest.TestCase):
     def test_units_cover_patch_and_flag_overflow(self):
         case = {"repo": "r", "title": "t", "body": "", "files": [
             {"path": "a.py", "status": "modified", "additions": 1, "deletions": 0, "patch": PATCH}]}
-        units, reasons = common.build_units(case, unit_chars=60, max_units=40)
+        budget = len(common.change_header(case)) + 300
+        units, reasons = common.build_units(case, unit_chars=budget, max_units=40)
         self.assertEqual(reasons, [])
         self.assertGreater(len(units), 1)
         joined = "".join(u["state"].split("Diff:\n", 1)[1] for u in units)
         self.assertEqual(joined, PATCH)                    # nothing dropped
-        _, reasons = common.build_units(case, unit_chars=60, max_units=1)
+        _, reasons = common.build_units(case, unit_chars=budget, max_units=1)
         self.assertEqual(reasons, ["unit_cap"])
 
     def test_long_lines_are_kept_whole_across_units(self):
-        patch = "@@ -1 +1 @@\n+" + "x" * 500 + "\n+tail\n"
+        patch = "@@ -1 +1 @@\n+" + "x" * 1500 + "\n+tail\n"
         case = {"repo": "r", "title": "t", "body": "", "files": [
             {"path": "a.min.js", "status": "modified", "additions": 2, "deletions": 0, "patch": patch}]}
-        units, reasons = common.build_units(case, unit_chars=100, max_units=40)
+        units, reasons = common.build_units(case, unit_chars=len(common.change_header(case)) + 300, max_units=40)
+        self.assertGreater(len(units), 2)
         self.assertEqual("".join(u["state"].split("Diff:\n", 1)[1] for u in units), patch)
         self.assertEqual(reasons, [])
+
+    def test_header_is_shared_bounded_and_from_the_prediction_view(self):
+        files = [{"path": f"src/pkg{i}/module_{i}.py", "status": "modified", "additions": 30 + i, "deletions": i,
+                  "patch": ("@@ -1,3 +1,4 @@\n" + "+line of code number %d\n" % i * 120)} for i in range(14)]
+        files += [{"path": "tests/test_module.py", "status": "added", "additions": 50, "deletions": 0,
+                   "patch": "@@ -0,0 +1 @@\n+assert True\n"},
+                  {"path": "src/auth/session.py", "status": "modified", "additions": 5, "deletions": 5,
+                   "patch": "@@ -1 +1 @@\n-old\n+new\n"},
+                  {"path": "assets/logo.png", "status": "added", "additions": 0, "deletions": 0, "patch": None}]
+        case = {"repo": "me/app", "title": "Refactor " + "x" * 400, "body": "Long description. " * 100,
+                "files": files, "strata": ["data_migration", "infra_ci"],          # from the final PR: hindsight
+                "outcome": {"review_comments": [{"body": "SECRET-REVIEW-NOTE"}]}}
+        units, _ = common.build_units(case)
+        header = common.change_header(case)
+        self.assertLessEqual(len(header), common.HEADER_CHARS)
+        self.assertEqual({u["header"] for u in units}, {header})                 # same header on every unit
+        self.assertTrue(all(u["state"] == header + u["body"] for u in units))
+        self.assertLessEqual(max(len(u["state"]) for u in units), common.UNIT_CHARS)   # header counted in budget
+        for f in files:                                                          # nothing lost to the header
+            if f["patch"]:
+                got = "".join(u["state"].split("Diff:\n", 1)[1] for u in units if u["path"] == f["path"])
+                self.assertTrue(f["patch"].startswith(got) and (got == f["patch"] or len(units) == common.MAX_UNITS))
+        # strata come from the files of this revision, not from case["strata"]
+        self.assertIn("strata: security 1;", header)
+        self.assertNotIn("data_migration", header)
+        self.assertNotIn("infra_ci", header)
+        self.assertNotIn("SECRET-REVIEW-NOTE", header)
+        self.assertIn("source 16 files", header)          # 14 modules + session.py + the binary
+        self.assertIn("test 1 files +50/-0", header)
+        self.assertIn("1 files without readable diff", header)
+        self.assertIn("src/auth/session.py source modified +5/-5 [security]", header)   # stratum file listed first
+        self.assertIn("more files)", header)
+
+    def test_majority_baseline(self):
+        q = common.load_questions()
+        self.assertEqual(build_dataset.majority(["none", "specialist", "none"], q["security_review"]), "none")
+        self.assertEqual(build_dataset.majority(["specialist", "none"], q["security_review"]), "none")   # tie: lower
+        self.assertIsNone(build_dataset.majority([], q["security_review"]))
+        exp = {"risk_score": 1, "criticality": "low", "human_review": "none", "ux_review": "none",
+               "security_review": "none", "performance_review": "none"}
+        sec = {**exp, "security_review": "specialist"}
+        # 3 test changes; each has 3 units; two changes have one specialist unit
+        units, changes = [], []
+        for i in range(3):
+            ids = [f"c{i}::u{j}" for j in range(3)]
+            for j, uid in enumerate(ids):
+                units.append({"id": uid, "expected": sec if (i < 2 and j == 0) else exp, "questions": q})
+            changes.append({"case_id": f"c{i}", "units": ids, "units_complete": True, "expected": sec if i < 2 else exp})
+        # most units are "none", most changes are "specialist": each level uses its own majority
+        maj = {"unit": exp, "change": sec}
+        m = evaluate.majority_baseline(maj, units, changes, q)["questions"]["security_review"]
+        self.assertAlmostEqual(m["unit_accuracy"], 7 / 9)
+        self.assertAlmostEqual(m["change_accuracy"], 2 / 3)
+        self.assertEqual((m["change_over_called"], m["escalation_missed"], m["escalation_needed"]), (1, 0, 2))
+        # a "none" change majority misses every escalation
+        m2 = evaluate.majority_baseline({"unit": exp, "change": exp}, units, changes, q)["questions"]["security_review"]
+        self.assertEqual((m2["escalation_missed"], m2["escalation_needed"]), (2, 2))
+        self.assertAlmostEqual(m2["change_accuracy"], 1 / 3)
 
     def test_missing_diffs_make_a_change_incomplete(self):
         ok = {"path": "a.py", "status": "modified", "additions": 1, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}
@@ -177,6 +240,9 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual({c["written_by"] for c in cases if c["kind"] == "commit"}, {"unmarked"})
             self.assertNotIn("abcdefgh12345678", pr["files"][0]["patch"])
             self.assertEqual(pr["outcome"]["review_comments"][0]["body"], "hard-coded token")
+            # one commit followed the first review; taken from the commit list already fetched
+            self.assertEqual(pr["outcome"]["commits_after_first_review"], 1)
+            self.assertEqual(sum(r.endswith("/pulls/1/commits") for r in FakeGitHub.requests), 1)
             self.assertNotIn("outcome", json.dumps({k: v for k, v in pr.items() if k != "outcome"}))
 
             # teacher request and response handling
@@ -217,6 +283,25 @@ class PipelineTest(unittest.TestCase):
             self.assertFalse({r["case_id"] for r in train} & {r["case_id"] for r in test})
             self.assertEqual(set(train[0]) >= {"state", "questions", "expected"}, True)
             self.assertNotIn("hard-coded token", train[0]["state"])   # outcome never reaches the input
+
+            def leaves(x, key=None):
+                if isinstance(x, dict):
+                    for k, v in x.items():
+                        yield from leaves(v, k)
+                elif isinstance(x, list):
+                    for v in x:
+                        yield from leaves(v, key)
+                elif isinstance(x, str) and key != "path" and len(x) >= 3:
+                    yield x
+            outcome = set(leaves(pr["outcome"])) | set(pr["outcome"]) | set(pr["outcome"]["observed"])
+            self.assertIn("unsafe", outcome)
+            self.assertIn("commits_after_first_review", outcome)
+            for row in train + val + test:                             # header and diff, every outcome field
+                for text in outcome:
+                    self.assertNotIn(text, row["state"])
+            self.assertTrue(all(r["state"].startswith("Repository: me/app\nChange: ") for r in train + val + test))
+            maj = json.load(open(f"{d}/majority.json"))
+            self.assertEqual((maj["unit"]["security_review"], maj["change"]["risk_score"]), ("specialist", 3))
             self.assertEqual(train[0]["expected"]["security_review"], "specialist")
             self.assertIn("by:claude", train[0]["tags"])
             tc = common.read_jsonl(f"{d}/test_changes.jsonl")[0]
@@ -250,6 +335,9 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual((b["escalation_missed"], b["escalation_needed"]), (1, 1))
             self.assertEqual((b["top_level_missed"], b["change_under_called"]), (1, 1))
             self.assertIn("| security_review | b |", open(f"{d}/report.md").read())
+            self.assertEqual(rep["majority"]["questions"]["security_review"]["change_accuracy"], 1.0)
+            self.assertIn("| security_review | majority |", open(f"{d}/report.md").read())
+            self.assertIn("| security_review | none: 0, automated: 0, specialist: 1 |", open(f"{d}/report.md").read())
 
             # a backend that skipped the change, or an incomplete diff, leaves nothing to score
             evaluate.main(["report", f"a={d}/a.jsonl", f"none={d}/missing.jsonl", "--data", f"{d}/test.jsonl",

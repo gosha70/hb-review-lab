@@ -106,11 +106,17 @@ def scrape_pr(token: str, c: dict) -> dict:
         revision = revision[:shas.index(first["commit_id"]) + 1] if first["commit_id"] in shas else None
     author, evidence = attribute(revision, ("author_login", c["author"]), ("pr_description", body))
 
+    all_shas = [k["sha"] for k in commits]
+    after = None
+    if first and len(commits) < PR_COMMIT_CAP and first["commit_id"] in all_shas:
+        after = len(all_shas) - all_shas.index(first["commit_id"]) - 1
+
     return {
         "body": redact(body), "body_source": body_source, "files": files, "diff_source": source,
         "files_complete": files_complete, "written_by": author, "written_by_evidence": evidence,
         "outcome": {
             "observed": c["observed"],
+            "commits_after_first_review": after,   # None when unknown (no review, or history rewritten)
             "reviews": [{"state": r["state"], "author": (r.get("user") or {}).get("login"),
                          "human": bool(human(r.get("user"))), "body": redact(r.get("body"))}
                         for r in reviews if r.get("body") or r["state"] != "COMMENTED"],

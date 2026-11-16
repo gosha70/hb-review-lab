@@ -36,11 +36,20 @@ because they contain repository content.
 
 How the data is shaped:
 
-- A change is cut into **units** (pieces of one file's diff, about 1,800 characters) so each
-  fits Laya's context window. Nothing is dropped silently: a change is marked
-  `units_complete: false`, with the reason, when it needs more than 40 units, when a changed
+- A change is cut into **units** so each fits Laya's context window. A unit is the change
+  header plus one piece of one file's diff, at most 2,250 characters in total, so a longer
+  header leaves less room for the diff. Nothing is dropped silently: a change is marked
+  `units_complete: false`, with the reason, when it needs more than 60 units, when a changed
   file has no readable diff (too large, or binary), or when not all files of the retrieved
   revision were fetched.
+- Every unit of a change carries the same **header** (at most 950 characters): repository,
+  title, the start of the description, a summary of the whole change, and a list of up to 8
+  files. The summary gives files added/deleted/renamed/modified; files and lines per kind
+  (source, test, docs); test lines per source line; files per path stratum (security,
+  migration, infra/CI, dependencies, UI); the top directories; and files without a readable
+  diff. The file list puts stratum files first, then source files, by lines changed. All of it
+  comes from the prediction view of the revision being classified. The teacher is shown the
+  same header and labels each unit for its own part in the change, read with that context.
 - Each case keeps a **prediction view** (title, description, diff) apart from an **outcome
   view** (review comments, CI, reverts). Only the teacher sees the outcome view.
 - For a reviewed PR the diff is the one that stood at the first human review, when GitHub still
@@ -93,6 +102,11 @@ python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl jev=
 The report (`out/report.md`, `out/report.json`) gives, per question and backend: unit accuracy
 and calibration error, change-level accuracy, under- and over-calls, and how many changes that
 needed escalation were missed. A change-level answer is the highest answer among its units.
+
+Each table also has a `majority` row: a classifier that always gives the train split's most
+common answer (`data/majority.json`, written by `build_dataset.py`). On a skewed question a
+backend can score high by doing the same, so a backend that does not beat `majority` there has
+learned nothing useful. The report also lists how the teacher's labels are distributed.
 
 Backends are compared only on changes that are complete, that every backend answered, and whose
 inputs no backend truncated. Changes with an incomplete diff or a truncated input are counted

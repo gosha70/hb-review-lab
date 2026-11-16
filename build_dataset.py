@@ -7,6 +7,8 @@ Writes to --out:
     val.jsonl            same format; for tuning training settings
     test.jsonl           same format; for the final comparison only
     test_changes.jsonl   one row per test change: its change-level labels and unit ids
+    majority.json        per question, the most common unit label and the most common change
+                         label in the train split: the constant baseline the report compares with
 
 Split: within each repository, in date order, the oldest changes train, the next --val-frac
 validate and the newest --test-frac test, so evaluation is always on changes made after the
@@ -19,11 +21,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from common import MAX_UNITS, UNIT_CHARS, build_units, load_questions, read_jsonl, unread_files, write_jsonl
+from common import (MAX_UNITS, UNIT_CHARS, build_units, load_questions, options, read_jsonl, unread_files,
+                    write_jsonl)
 
 
 def split(cases: list[dict], val_frac: float, test_frac: float, holdout: set[str]):
@@ -43,6 +47,16 @@ def split(cases: list[dict], val_frac: float, test_frac: float, holdout: set[str
         val += rows[n - n_test - n_val:n - n_test]
         test += rows[n - n_test:]
     return train, val, test
+
+
+def majority(values: list, q: dict):
+    """The most common answer; ties go to the lower option. None when there are no values."""
+    counts = Counter(values)
+    best = None
+    for o in options(q):
+        if counts[o] and (best is None or counts[o] > counts[best]):
+            best = o
+    return best
 
 
 def unit_rows(case: dict, label: dict, questions: dict) -> list[dict]:
@@ -101,6 +115,13 @@ def main(argv=None) -> int:
         "incomplete_reasons": labels[c["case_id"]].get("incomplete_reasons", []),
         "unread_files": unread_files(c), "written_by": c.get("written_by", "unmarked"),
     } for c in test])
+
+    train_changes = [labels[c["case_id"]]["change"] for c in train if labels[c["case_id"]]["change"]]
+    (out / "majority.json").write_text(json.dumps({
+        "source": "train split only",
+        "unit": {qid: majority([r["expected"][qid] for r in train_rows], q) for qid, q in questions.items()},
+        "change": {qid: majority([ch[qid] for ch in train_changes], q) for qid, q in questions.items()},
+    }, indent=1))
 
     print(f"train: {len(train)} changes, {len(train_rows)} units")
     print(f"val:   {len(val)} changes, {len(val_rows)} units")

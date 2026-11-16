@@ -3,11 +3,50 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-UNIT_CHARS = 1800   # diff characters per unit; sized for a 1,024-token Laya window
-MAX_UNITS = 40      # units per change; larger changes are flagged incomplete
+UNIT_CHARS = 2250    # characters per unit state (header + diff piece); sized for a 1,024-token Laya window
+HEADER_CHARS = 950   # cap on the change header that every unit of a change carries
+MIN_DIFF_CHARS = 200
+MAX_UNITS = 60       # units per change; larger changes are flagged incomplete
+MAX_FILES_LISTED = 8
+
+# Heuristic path strata, used for sampling and in the change header. These are NOT risk labels.
+SENSITIVE = {
+    "security": re.compile(
+        r"auth|login|session|token|secret|crypt|passw|permission|acl|oauth|jwt|saml|sso|"
+        r"cors|csrf|sanitiz|security|credential|\.env",
+        re.I,
+    ),
+    "data_migration": re.compile(r"migrations?/|\.sql$|schema|alembic|flyway|liquibase", re.I),
+    "infra_ci": re.compile(
+        r"dockerfile|docker-compose|\.github/workflows|terraform|\.tf$|k8s|kubernetes|helm|"
+        r"deploy|nginx|\.gitlab-ci",
+        re.I,
+    ),
+    "dependencies": re.compile(
+        r"(^|/)(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|"
+        r"pyproject\.toml|poetry\.lock|uv\.lock|go\.(mod|sum)|cargo\.(toml|lock)|pom\.xml|"
+        r"build\.gradle(\.kts)?|gemfile(\.lock)?)$",
+        re.I,
+    ),
+    "ui": re.compile(r"\.(tsx|jsx|vue|svelte|css|scss|html)$", re.I),
+}
+
+_TEST = re.compile(
+    r"(^|/)(tests?|__tests__|specs?|testing)/|(^|/)test_[^/]*\.py$|_test\.(go|py|rb|rs|cc|cpp)$|"
+    r"\.(test|spec)\.[cm]?[jt]sx?$|Tests?\.(java|kt|cs|scala)$", re.I)
+_DOCS = re.compile(r"\.(md|mdx|rst|adoc|txt)$|(^|/)docs?/", re.I)
+
+
+def file_kind(path: str) -> str:
+    return "test" if _TEST.search(path) else "docs" if _DOCS.search(path) else "source"
+
+
+def file_strata(path: str) -> list[str]:
+    return [k for k, rx in SENSITIVE.items() if rx.search(path)]
 
 
 # ---------- JSONL ----------
@@ -104,8 +143,69 @@ def _chunks(patch: str, limit: int) -> list[str]:
     return out
 
 
+def _short(path: str, limit: int = 60) -> str:
+    if len(path) <= limit:
+        return path
+    return ("…/" + "/".join(path.split("/")[-2:]))[-limit:]
+
+
+def change_header(case: dict) -> str:
+    """The context every unit of a change carries: what the whole change touches.
+
+    Built from the prediction view only (title, description and files of the revision being
+    classified). Path strata are taken per file here, never from case["strata"], which the audit
+    computes from the final pull request and may include files added after the review.
+    """
+    files = case["files"]
+    lines = lambda f: f["additions"] + f["deletions"]
+    status = Counter({"added": "added", "removed": "deleted", "renamed": "renamed"}.get(f["status"], "modified")
+                     for f in files)
+    kinds = {k: [f for f in files if file_kind(f["path"]) == k] for k in ("source", "test", "docs")}
+    per_kind = "; ".join(
+        f"{k} {len(v)} files +{sum(f['additions'] for f in v)}/-{sum(f['deletions'] for f in v)}"
+        for k, v in kinds.items() if v)
+    src_lines = sum(lines(f) for f in kinds["source"])
+    ratio = f"{sum(lines(f) for f in kinds['test']) / src_lines:.2f}" if src_lines else "none"
+    strata = Counter(s for f in files for s in file_strata(f["path"]))
+    dirs = Counter(f["path"].split("/")[0] if "/" in f["path"] else "." for f in files)
+    unread = len(unread_files(case))
+    head = (
+        f"Repository: {case['repo']}\n"
+        f"Change: {' '.join((case['title'] or '').split())[:150]}\n"
+        f"Description: {' '.join((case.get('body') or '').split())[:300]}\n"
+        f"Summary: {len(files)} files ({status['added']} added, {status['deleted']} deleted, "
+        f"{status['renamed']} renamed, {status['modified']} modified); {per_kind or 'no files'}; "
+        f"test lines per source line {ratio}; "
+        f"strata: {', '.join(f'{k} {n}' for k, n in sorted(strata.items())) or 'none'}; "
+        f"directories: {', '.join(d for d, _ in dirs.most_common(5))}; "
+        f"{unread} files without readable diff\n")[:HEADER_CHARS - 1]
+    if not head.endswith("\n"):
+        head += "\n"
+    # Files in a stratum first, then source, then the rest; each group by lines changed.
+    ranked = sorted(files, key=lambda f: (0 if file_strata(f["path"]) else 1 if file_kind(f["path"]) == "source" else 2,
+                                          -lines(f), f["path"]))
+    rows = []
+    for f in ranked[:MAX_FILES_LISTED]:
+        tags = file_strata(f["path"])
+        rows.append(f"  {_short(f['path'])} {file_kind(f['path'])} {f['status']} +{f['additions']}/-{f['deletions']}"
+                    + (f" [{','.join(tags)}]" if tags else "") + "\n")
+
+    def render(n: int) -> str:
+        more = f"  ({len(files) - n} more files)\n" if len(files) > n else ""
+        return head + "Files:\n" + "".join(rows[:n]) + more
+
+    n = len(rows)
+    while n and len(render(n)) > HEADER_CHARS:
+        n -= 1
+    return render(n) if len(render(n)) <= HEADER_CHARS else head
+
+
 def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_UNITS):
     """One classifier input per diff piece. Returns (units, incomplete_reasons).
+
+    Every unit's state is the change header followed by one piece of one file's diff, and is at
+    most `unit_chars` characters, so the header's length comes out of the room for the diff.
+    Each unit also carries `body` (its state without the header).
 
     The units cover the whole change only when incomplete_reasons is empty. Reasons:
       unit_cap           the change needs more than `max_units` units; only the first are returned
@@ -115,12 +215,7 @@ def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_U
     Callers must treat an incomplete change as not fully classified, never as safe.
     """
     files = case["files"]
-    header = (
-        f"Repository: {case['repo']}\n"
-        f"Change: {case['title']}\n"
-        f"Description: {(case.get('body') or '').strip()[:300]}\n"
-        f"Files changed: {len(files)} "
-        f"(+{sum(f['additions'] for f in files)} -{sum(f['deletions'] for f in files)})\n")
+    header = change_header(case)
     units, reasons = [], []
     if case.get("files_complete") is False:
         reasons.append("files_not_fetched")
@@ -131,13 +226,13 @@ def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_U
             elif f["status"] != "renamed":      # a pure rename changes no content
                 reasons.append("unreadable_file")
             continue
-        parts = _chunks(f["patch"], unit_chars)
+        label = f"File: {f['path']} [{f['status']}]"
+        room = unit_chars - len(header) - len(f"{label} part 999/999\nDiff:\n")
+        parts = _chunks(f["patch"], max(MIN_DIFF_CHARS, room))
         for i, part in enumerate(parts, 1):
-            units.append({
-                "unit": f"u{len(units) + 1}",
-                "path": f["path"],
-                "state": f"{header}File: {f['path']} [{f['status']}] part {i}/{len(parts)}\nDiff:\n{part}",
-            })
+            body = f"{label} part {i}/{len(parts)}\nDiff:\n{part}"
+            units.append({"unit": f"u{len(units) + 1}", "path": f["path"], "header": header,
+                          "body": body, "state": header + body})
     if len(units) > max_units:
         reasons.append("unit_cap")
     return units[:max_units], sorted(set(reasons))

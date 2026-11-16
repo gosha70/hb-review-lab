@@ -173,17 +173,46 @@ def score(preds: dict, units: list[dict], changes: list[dict], scored: list[dict
         out["questions"][qid] = {
             "unit_accuracy": sum(hits) / len(hits) if hits else None,
             "unit_ece": ece(conf),
-            **change_metrics(preds, scored, qid, q),
+            **change_metrics(scored, qid, q, unit_max(preds, qid, q)),
         }
         for a in authors:
             group = [c for c in scored if c.get("written_by", "unmarked") == a]
-            out["by_author"].setdefault(a, {})[qid] = {"changes": len(group), **change_metrics(preds, group, qid, q)}
+            out["by_author"].setdefault(a, {})[qid] = {
+                "changes": len(group), **change_metrics(group, qid, q, unit_max(preds, qid, q))}
     return out
 
 
-def change_metrics(preds: dict, group: list[dict], qid: str, q: dict) -> dict:
+def unit_max(preds: dict, qid: str, q: dict):
+    """A backend's change-level answer: the highest answer among the change's units."""
+    return lambda c: max(level(q, preds[i]["answers"][qid]["label"]) for i in c["units"])
+
+
+def majority_baseline(maj: dict, units: list[dict], scored: list[dict], questions: dict) -> dict:
+    """A classifier that always gives the train split's most common answer.
+
+    Unit accuracy uses the unit majority. Change-level numbers use the change majority, which
+    can differ: a change takes the highest of its units, so most units can be the lowest option
+    while most changes are not.
+    """
+    out = {"questions": {}, "by_author": {}}
+    authors = sorted({c.get("written_by", "unmarked") for c in scored})
+    for qid, q in questions.items():
+        hits = [u["expected"][qid] == maj["unit"][qid] for u in units]
+        const = (lambda lv: lambda c: lv)(level(q, maj["change"][qid]))
+        out["questions"][qid] = {
+            "unit_accuracy": sum(hits) / len(hits) if hits else None, "unit_ece": None,
+            "unit_answer": maj["unit"][qid], "change_answer": maj["change"][qid],
+            **change_metrics(scored, qid, q, const),
+        }
+        for a in authors:
+            group = [c for c in scored if c.get("written_by", "unmarked") == a]
+            out["by_author"].setdefault(a, {})[qid] = {"changes": len(group), **change_metrics(group, qid, q, const)}
+    return out
+
+
+def change_metrics(group: list[dict], qid: str, q: dict, pred_level) -> dict:
     gold = [level(q, c["expected"][qid]) for c in group]
-    pred = [max(level(q, preds[i]["answers"][qid]["label"]) for i in c["units"]) for c in group]
+    pred = [pred_level(c) for c in group]
     need = [(g, p) for g, p in zip(gold, pred) if g > 0]          # changes that need escalation
     top = len(options(q)) - 1
     need_top = [(g, p) for g, p in zip(gold, pred) if g == top]   # changes at the highest level
@@ -262,6 +291,12 @@ def cmd_report(args) -> int:
               and all(i in p for p in preds.values() for i in c["units"])]
     reasons = Counter(r for c in incomplete for r in c.get("incomplete_reasons") or ["unspecified"])
     results = {name: score(p, units, changes, scored, questions) for name, p in preds.items()}
+    # Constant baseline from the train split, shown in the per-question tables only.
+    rows = dict(results)
+    maj_path = Path(args.majority) if args.majority else Path(args.data).parent / "majority.json"
+    maj = json.loads(maj_path.read_text()) if maj_path.exists() else None
+    if maj and all(maj["unit"].get(q) is not None and maj["change"].get(q) is not None for q in questions):
+        rows["majority"] = majority_baseline(maj, units, scored, questions)
 
     md = ["# Classifier comparison", "",
           f"Held-out set: {len(changes)} changes, {len(units)} units.",
@@ -285,12 +320,20 @@ def cmd_report(args) -> int:
            "Escalation missed | Top level missed |",
            "|---|---|---|---|---|---|---|---|---|"]
     for qid in questions:
-        for name, r in results.items():
+        for name, r in rows.items():
             m = r["questions"][qid]
             md.append(
                 f"| {qid} | {name} | {fmt(m['unit_accuracy'], True)} | {fmt(m['unit_ece'])} | "
                 f"{fmt(m['change_accuracy'], True)} | {m['change_under_called']} | {m['change_over_called']} | "
                 f"{m['escalation_missed']}/{m['escalation_needed']} | {m['top_level_missed']}/{m['top_level_needed']} |")
+    if "majority" in rows:
+        md += ["", "`majority` always gives the train split's most common answer (unit majority for unit "
+               "accuracy, change majority for the change columns). A backend that does not beat it on a "
+               "question has learned nothing useful there."]
+    md += ["", "## Teacher labels on the scored changes", "", "| Question | Changes per answer |", "|---|---|"]
+    for qid, q in questions.items():
+        dist = Counter(c["expected"][qid] for c in scored)
+        md.append(f"| {qid} | " + ", ".join(f"{o}: {dist[o]}" for o in options(q)) + " |")
     groups = Counter(c.get("written_by", "unmarked") for c in scored)
     if len(groups) > 1:
         md += ["", "## By author", "",
@@ -300,7 +343,7 @@ def cmd_report(args) -> int:
                "Escalation missed |", "|---|---|---|---|---|---|---|---|"]
         for qid in questions:
             for a in sorted(groups):
-                for name, r in results.items():
+                for name, r in rows.items():
                     m = r["by_author"][a][qid]
                     md.append(f"| {qid} | {a} | {m['changes']} | {fmt(m['escalation_needed'] / m['changes'], True)} | "
                               f"{name} | {fmt(m['change_accuracy'], True)} | {m['change_under_called']} | "
@@ -308,7 +351,7 @@ def cmd_report(args) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.with_suffix(".md").write_text("\n".join(md) + "\n")
-    out.with_suffix(".json").write_text(json.dumps(results, indent=1))
+    out.with_suffix(".json").write_text(json.dumps(rows, indent=1))
     print("\n".join(md))
     return 0
 
@@ -335,6 +378,8 @@ def main(argv=None) -> int:
     r.add_argument("predictions", nargs="+", help="name=path/to/predictions.jsonl")
     r.add_argument("--data", default="data/test.jsonl")
     r.add_argument("--changes", default="data/test_changes.jsonl")
+    r.add_argument("--majority", default=None,
+                   help="baseline file from build_dataset.py (default: majority.json next to --data)")
     r.add_argument("--out", default="out/report")
     r.set_defaults(fn=cmd_report)
     t = sub.add_parser("teachers", help="compare two teachers' change-level labels")

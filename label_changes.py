@@ -41,8 +41,11 @@ Label the change as it was submitted: the risk it carried and the review it need
 moment. The "Outcome" section is hindsight (review comments, CI, reverts). Use it as evidence of
 what the change actually needed, but do not label the later fixes.
 
-A unit's labels describe that unit alone. The change-level label for a question is never lower
-than the highest label among its units.
+The classifier sees one unit at a time, each under the same change header (shown below), so it
+knows what else the change touches. Label a unit for its own part in the change, read with that
+context: raise it when the unit is risky because of what the rest of the change does, but do not
+raise it merely because another unit is risky. The change-level label for a question is never
+lower than the highest label among its units.
 
 Questions:
 {rubric}"""
@@ -92,9 +95,10 @@ def prompt(case: dict, units: list[dict], incomplete: list[str]) -> str:
               for r in o["reviews"]]
     parts += [f"  comment on {c['path']}:{c['line']} by {'human' if c['human'] else 'bot/author'}: {c['body']}"
               for c in o["review_comments"]]
+    if units:
+        parts += ["", "=== change header the classifier sees on every unit ===", units[0]["header"].rstrip()]
     for u in units:
-        body = u["state"].split("\nFile: ", 1)[1]
-        parts += ["", f"=== unit {u['unit']} ===", f"File: {body}"]
+        parts += ["", f"=== unit {u['unit']} ===", u["body"]]
     parts += ["", f"Label the change and each of the {len(units)} units."]
     return "\n".join(parts)
 

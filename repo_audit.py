@@ -36,29 +36,10 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from common import SENSITIVE
+
 API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 
-# Heuristic strata for sampling. These are NOT risk labels.
-SENSITIVE = {
-    "security": re.compile(
-        r"auth|login|session|token|secret|crypt|passw|permission|acl|oauth|jwt|saml|sso|"
-        r"cors|csrf|sanitiz|security|credential|\.env",
-        re.I,
-    ),
-    "data_migration": re.compile(r"migrations?/|\.sql$|schema|alembic|flyway|liquibase", re.I),
-    "infra_ci": re.compile(
-        r"dockerfile|docker-compose|\.github/workflows|terraform|\.tf$|k8s|kubernetes|helm|"
-        r"deploy|nginx|\.gitlab-ci",
-        re.I,
-    ),
-    "dependencies": re.compile(
-        r"(^|/)(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|"
-        r"pyproject\.toml|poetry\.lock|uv\.lock|go\.(mod|sum)|cargo\.(toml|lock)|pom\.xml|"
-        r"build\.gradle(\.kts)?|gemfile(\.lock)?)$",
-        re.I,
-    ),
-    "ui": re.compile(r"\.(tsx|jsx|vue|svelte|css|scss|html)$", re.I),
-}
 REVERT_RE = re.compile(r"^revert\b", re.I)
 REVERTS_SHA_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
 FIX_RE = re.compile(r"\b(fix(es|ed)?|bug|hotfix|regression|patch(es|ed)?)\b", re.I)

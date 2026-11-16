@@ -6,13 +6,16 @@
 
     # Jev (hosted API; sends the test diffs to TypeSafe)
     export TYPESAFE_API_KEY=...
-    python evaluate.py predict --backend jev --out out/pred.jev.jsonl
+    python evaluate.py predict --backend jev --allow-external typesafe --out out/pred.jev.jsonl
 
     # Side-by-side report
     python evaluate.py report laya=out/pred.laya.jsonl jev=out/pred.jev.jsonl --out out/report
 
 Every backend answers the same unit inputs with the same questions. A change-level answer is
 the highest answer among the change's units, so one risky unit escalates the whole change.
+
+Backends are compared only on changes that are complete and that every backend answered in
+full. A change whose diff is incomplete is never scored as classified: policy escalates it.
 """
 from __future__ import annotations
 
@@ -60,9 +63,19 @@ def predict_laya(rows, questions, args):
 
 
 def predict_jev(rows, questions, args):
+    if args.allow_external != "typesafe":
+        sys.exit("This step sends the test diffs to TypeSafe's Jev API.\n"
+                 "Re-run with --allow-external typesafe to confirm, and use --exclude-repo for "
+                 "repositories that must stay local.")
     key = os.environ.get("TYPESAFE_API_KEY")
     if not key:
         sys.exit("Set TYPESAFE_API_KEY.")
+    excluded = set(args.exclude_repo)
+    rows = [r for r in rows if r["tags"][0] not in excluded]
+    sent = Path(args.out).with_suffix(".sent.jsonl")
+    for r in rows:   # audit trail of what leaves this machine
+        append_jsonl(sent, {"provider": "typesafe", "id": r["id"], "repo": r["tags"][0],
+                            "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
 
     def call(r):
         body = json.dumps({"state": r["state"], "questions": questions, "model": args.jev_model}).encode()
@@ -127,7 +140,7 @@ def ece(pairs: list[tuple[float, bool]], bins: int = 10) -> float | None:
     return total / len(pairs)
 
 
-def score(preds: dict, units: list[dict], changes: list[dict], questions: dict) -> dict:
+def score(preds: dict, units: list[dict], changes: list[dict], scored: list[dict], questions: dict) -> dict:
     answered = [u for u in units if u["id"] in preds]
     lat = sorted(preds[u["id"]]["ms"] for u in answered)
     out = {
@@ -137,7 +150,7 @@ def score(preds: dict, units: list[dict], changes: list[dict], questions: dict) 
         "latency_ms_p95": lat[int(0.95 * (len(lat) - 1))] if lat else None,
         "changes": len(changes), "questions": {},
     }
-    scored = [c for c in changes if c["units"] and all(i in preds for i in c["units"])]
+    out["changes_answered"] = sum(bool(c["units"]) and all(i in preds for i in c["units"]) for c in changes)
     out["changes_scored"] = len(scored)
     for qid, q in questions.items():
         hits = [preds[u["id"]]["answers"][qid]["label"] == u["expected"][qid] for u in answered]
@@ -172,22 +185,28 @@ def cmd_report(args) -> int:
     units = read_jsonl(args.data)
     changes = read_jsonl(args.changes)
     questions = units[0]["questions"]
-    results = {}
+    preds = {}
     for spec in args.predictions:
         name, _, path = spec.partition("=")
         if not path:
             sys.exit(f"Give predictions as name=path, got {spec!r}")
-        results[name] = score({r["id"]: r for r in read_jsonl(path)}, units, changes, questions)
+        preds[name] = {r["id"]: r for r in read_jsonl(path)}
+    incomplete = [c for c in changes if not c["units_complete"]]
+    scored = [c for c in changes if c["units_complete"] and c["units"]
+              and all(i in p for p in preds.values() for i in c["units"])]
+    results = {name: score(p, units, changes, scored, questions) for name, p in preds.items()}
 
     md = ["# Classifier comparison", "",
-          f"Held-out set: {len(changes)} changes, {len(units)} units. "
-          f"{sum(not c['units_complete'] for c in changes)} changes exceed the unit cap and are only partly classified.",
-          "Labels are teacher-inferred, so every number is agreement with the teacher.", "",
-          "| Backend | Units answered | Truncated inputs | Changes scored | Latency mean (ms/unit) | Latency p95 |",
+          f"Held-out set: {len(changes)} changes, {len(units)} units.",
+          f"- {len(scored)} changes are scored: complete, and answered in full by every backend.",
+          f"- {len(incomplete)} changes have an incomplete diff. They are not scored; policy must escalate them.",
+          f"- {len(changes) - len(scored) - len(incomplete)} complete changes were not answered by every backend.",
+          "", "Labels are teacher-inferred, so every number is agreement with the teacher.", "",
+          "| Backend | Units answered | Truncated inputs | Changes answered | Latency mean (ms/unit) | Latency p95 |",
           "|---|---|---|---|---|---|"]
     for name, r in results.items():
         md.append(f"| {name} | {r['units_answered']}/{r['units']} | {r['units_truncated']} | "
-                  f"{r['changes_scored']}/{r['changes']} | {fmt(r['latency_ms_mean'])} | {fmt(r['latency_ms_p95'])} |")
+                  f"{r['changes_answered']}/{r['changes']} | {fmt(r['latency_ms_mean'])} | {fmt(r['latency_ms_p95'])} |")
     md += ["", "Escalation missed: the change needed more than the lowest option and the classifier chose the lowest.",
            "Top level missed: the change needed the highest option and the classifier chose lower.", "",
            "| Question | Backend | Unit accuracy | Unit ECE | Change accuracy | Under-called | Over-called | "
@@ -221,6 +240,10 @@ def main(argv=None) -> int:
     p.add_argument("--max-len", type=int, default=1024)
     p.add_argument("--jev-model", default="jev-1.13.0")
     p.add_argument("--concurrency", type=int, default=4)
+    p.add_argument("--allow-external", choices=["typesafe"],
+                   help="jev: required; confirms the test diffs may be sent to TypeSafe")
+    p.add_argument("--exclude-repo", action="append", default=[],
+                   help="jev: owner/name whose code must never be sent (repeatable)")
     p.set_defaults(fn=cmd_predict)
     r = sub.add_parser("report")
     r.add_argument("predictions", nargs="+", help="name=path/to/predictions.jsonl")

@@ -23,10 +23,10 @@ python scrape_changes.py --candidates audit_out/candidates.jsonl --out data/case
 # 1c. Teacher labels from Claude (Batches API). Try 20 cases first.
 pip install anthropic
 export ANTHROPIC_API_KEY=...
-python label_changes.py --limit 20
-python label_changes.py
+python label_changes.py --allow-external anthropic --limit 20
+python label_changes.py --allow-external anthropic
 
-# 1d. Laya train/test files, split by time within each repository
+# 1d. Laya train/val/test files, split by time within each repository
 python build_dataset.py --out data
 ```
 
@@ -36,12 +36,17 @@ because they contain repository content.
 How the data is shaped:
 
 - A change is cut into **units** (pieces of one file's diff, about 1,800 characters) so each
-  fits Laya's context window. Nothing is dropped silently: a change needing more than 40 units
-  is marked `units_complete: false`.
+  fits Laya's context window. Nothing is dropped silently: a change is marked
+  `units_complete: false`, with the reason, when it needs more than 40 units, when GitHub
+  returned no diff for a changed file, or when not all of its files were fetched.
 - Each case keeps a **prediction view** (title, description, diff) apart from an **outcome
   view** (review comments, CI, reverts). Only the teacher sees the outcome view.
 - For a reviewed PR the diff is the one that stood at the first human review, when GitHub still
-  has that commit (`diff_source` records which).
+  has that commit (`diff_source` records which). GitHub keeps only the current PR description,
+  so one edited after the first review is left out (`body_source`).
+- Sending code out needs an explicit flag (`--allow-external`), repositories can be kept local
+  with `--exclude-repo`, and every case sent is logged to a `.sent.jsonl` file. Secret redaction
+  covers common key formats only; treat it as a safety net.
 - Labels are `label_source: "inferred"`: the teacher's judgement, not human-validated.
 
 ## 2. Train Laya on the DGX Spark
@@ -53,10 +58,11 @@ and `out/`.
 ```bash
 spark/run.sh smoke     # GPU inference check
 spark/run.sh dryrun    # validate data/train.jsonl, print the optimizer budget
-spark/run.sh train     # fine-tune + calibrate + before/after eval on data/test.jsonl
+spark/run.sh train     # fine-tune + calibrate + before/after eval on data/val.jsonl
 ```
 
 The checkpoint is written to `out/hb-review/`, the log to `out/hb-review.train.log`.
+Tune settings against `val.jsonl`; `test.jsonl` is read only by `predict` in step 3.
 Settings are environment variables, for example:
 
 ```bash
@@ -70,7 +76,7 @@ spark/run.sh predict                    # tuned Laya   -> out/pred.laya.jsonl
 spark/run.sh predict english base       # untuned Laya -> out/pred.base.jsonl
 
 export TYPESAFE_API_KEY=...
-python evaluate.py predict --backend jev --out out/pred.jev.jsonl
+python evaluate.py predict --backend jev --allow-external typesafe --out out/pred.jev.jsonl
 
 python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl jev=out/pred.jev.jsonl
 ```
@@ -79,8 +85,8 @@ The report (`out/report.md`, `out/report.json`) gives, per question and backend:
 and calibration error, change-level accuracy, under- and over-calls, and how many changes that
 needed escalation were missed. A change-level answer is the highest answer among its units.
 
-The Jev step sends the held-out diffs to TypeSafe's API, and step 1c sends all diffs to
-Anthropic's. Check that is acceptable for private repositories before running them.
+Backends are compared only on changes that are complete and that every backend answered.
+Changes with an incomplete diff are counted separately and never scored as classified.
 
 ## Tests
 

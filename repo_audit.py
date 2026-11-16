@@ -83,7 +83,7 @@ query($owner:String!,$name:String!,$cursor:String){
     pullRequests(first:50, after:$cursor, orderBy:{field:CREATED_AT,direction:DESC}){
       totalCount pageInfo{hasNextPage endCursor}
       nodes{
-        number title createdAt mergedAt state additions deletions changedFiles
+        number title createdAt mergedAt lastEditedAt state additions deletions changedFiles
         author{login __typename}
         baseRefOid headRefOid mergeCommit{oid}
         comments{totalCount}
@@ -327,7 +327,7 @@ def analyse(store: Store, repo: str) -> tuple[dict, list[dict]]:
         merge_oid = (p["mergeCommit"] or {}).get("oid")
         cands.append({
             "repo": repo, "kind": "pr", "id": p["number"], "title": p["title"],
-            "date": p["createdAt"], "state": p["state"],
+            "date": p["createdAt"], "state": p["state"], "body_edited_at": p.get("lastEditedAt"),
             "base_sha": p["baseRefOid"], "head_sha": p["headRefOid"], "merge_sha": merge_oid,
             "author": author, "author_is_bot": is_bot(p["author"]),
             "additions": p["additions"], "deletions": p["deletions"],

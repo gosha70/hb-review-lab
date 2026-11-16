@@ -67,6 +67,9 @@ def scrape_pr(token: str, c: dict) -> dict:
     def human(u):
         return u and u.get("type") != "Bot" and u.get("login") != c["author"]
 
+    # Three-dot compare diffs from the merge base of the two commits, i.e. the point where the PR
+    # branched off, so the result is the PR's own changes as of the first review even if the base
+    # branch has moved since. If that commit is gone (force-push), fall back to the final diff.
     files, source = None, "final"
     first = next((r for r in sorted(reviews, key=lambda r: r.get("submitted_at") or "")
                   if human(r.get("user")) and r.get("commit_id")), None)
@@ -79,8 +82,15 @@ def scrape_pr(token: str, c: dict) -> dict:
     if files is None:
         files = files_of(paged(token, f"/repos/{repo}/pulls/{n}/files", MAX_FILE_PAGES))
 
+    # GitHub keeps only the current description. If it was edited after the first review it may
+    # describe the fixes, so it is left out of the prediction view.
+    body, body_source = pr.get("body"), "current"
+    edited = c.get("body_edited_at")
+    if first and edited and edited > (first.get("submitted_at") or ""):
+        body, body_source = "", "omitted_edited_after_first_review"
+
     return {
-        "body": redact(pr.get("body")), "files": files, "diff_source": source,
+        "body": redact(body), "body_source": body_source, "files": files, "diff_source": source,
         "outcome": {
             "observed": c["observed"],
             "reviews": [{"state": r["state"], "author": (r.get("user") or {}).get("login"),
@@ -99,7 +109,8 @@ def scrape_commit(token: str, c: dict) -> dict:
     message = d["commit"]["message"]
     body = message.split("\n", 1)[1].strip() if "\n" in message else ""
     return {
-        "body": redact(body), "files": files_of(d.get("files", [])), "diff_source": "final",
+        "body": redact(body), "body_source": "current",
+        "files": files_of(d.get("files", [])), "diff_source": "final",
         "outcome": {"observed": c["observed"], "reviews": [], "review_comments": []},
     }
 
@@ -149,7 +160,7 @@ def main(argv=None) -> int:
         append_jsonl(args.out, {
             "case_id": case_id(c), "repo": c["repo"], "kind": c["kind"], "id": c["id"],
             "date": c["date"], "title": redact(c["title"]), "author": c["author"],
-            "strata": c["strata"], **detail,
+            "strata": c["strata"], "files_total": c.get("changed_files"), **detail,
         })
         written += 1
         if i % 50 == 0:

@@ -91,13 +91,30 @@ class PipelineTest(unittest.TestCase):
     def test_units_cover_patch_and_flag_overflow(self):
         case = {"repo": "r", "title": "t", "body": "", "files": [
             {"path": "a.py", "status": "modified", "additions": 1, "deletions": 0, "patch": PATCH}]}
-        units, complete = common.build_units(case, unit_chars=60, max_units=40)
-        self.assertTrue(complete)
+        units, reasons = common.build_units(case, unit_chars=60, max_units=40)
+        self.assertEqual(reasons, [])
         self.assertGreater(len(units), 1)
         joined = "".join(u["state"].split("Diff:\n", 1)[1] for u in units)
         self.assertEqual(joined, PATCH)                    # nothing dropped
-        _, complete = common.build_units(case, unit_chars=60, max_units=1)
-        self.assertFalse(complete)
+        _, reasons = common.build_units(case, unit_chars=60, max_units=1)
+        self.assertEqual(reasons, ["unit_cap"])
+
+    def test_long_lines_are_kept_whole_across_units(self):
+        patch = "@@ -1 +1 @@\n+" + "x" * 500 + "\n+tail\n"
+        case = {"repo": "r", "title": "t", "body": "", "files": [
+            {"path": "a.min.js", "status": "modified", "additions": 2, "deletions": 0, "patch": patch}]}
+        units, reasons = common.build_units(case, unit_chars=100, max_units=40)
+        self.assertEqual("".join(u["state"].split("Diff:\n", 1)[1] for u in units), patch)
+        self.assertEqual(reasons, [])
+
+    def test_missing_diffs_make_a_change_incomplete(self):
+        ok = {"path": "a.py", "status": "modified", "additions": 1, "deletions": 0, "patch": "@@ -1 +1 @@\n+x\n"}
+        big = {"path": "big.sql", "status": "modified", "additions": 9000, "deletions": 0, "patch": None}
+        binary = {"path": "logo.png", "status": "added", "additions": 0, "deletions": 0, "patch": None}
+        base = {"repo": "r", "title": "t", "body": ""}
+        self.assertEqual(common.build_units({**base, "files": [ok, binary]})[1], [])
+        self.assertEqual(common.build_units({**base, "files": [ok, big]})[1], ["file_without_diff"])
+        self.assertEqual(common.build_units({**base, "files": [ok], "files_total": 400})[1], ["files_not_fetched"])
 
     def test_redact(self):
         out = common.redact("password = 'hunter2hunter2'\nkey AKIAABCDEFGHIJKLMNOP\nx = 1")
@@ -108,7 +125,7 @@ class PipelineTest(unittest.TestCase):
     def test_end_to_end(self):
         questions = common.load_questions()
         with tempfile.TemporaryDirectory() as d:
-            cands = [cand("pr", 1, "2026-01-01T00:00:00Z"),
+            cands = [cand("pr", 1, "2026-01-01T00:00:00Z", body_edited_at="2026-01-03T00:00:00Z"),
                      cand("commit", "c" * 40, "2026-02-01T00:00:00Z"),
                      cand("commit", "d" * 40, "2026-03-01T00:00:00Z"),
                      cand("commit", "e" * 40, "2026-04-01T00:00:00Z", author_is_bot=True)]
@@ -120,6 +137,7 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(len(cases), 3)                # bot-authored change excluded
             pr = next(c for c in cases if c["kind"] == "pr")
             self.assertEqual(pr["diff_source"], "at_first_review")
+            self.assertEqual((pr["body"], pr["body_source"]), ("", "omitted_edited_after_first_review"))
             self.assertNotIn("abcdefgh12345678", pr["files"][0]["patch"])
             self.assertEqual(pr["outcome"]["review_comments"][0]["body"], "hard-coded token")
             self.assertNotIn("outcome", json.dumps({k: v for k, v in pr.items() if k != "outcome"}))
@@ -137,11 +155,18 @@ class PipelineTest(unittest.TestCase):
                                                           "max_units": 40, **lab})
             with self.assertRaises(ValueError):
                 label_changes.parse(teacher_answer([]), pr, questions, 1800, 40)
+            with self.assertRaises(SystemExit):      # nothing is sent without explicit confirmation
+                label_changes.main(["--cases", f"{d}/cases.jsonl", "--out", f"{d}/x.jsonl"])
 
             # dataset: newest change of the repo is held out; rows are in Laya's format
             self.assertEqual(build_dataset.main(["--cases", f"{d}/cases.jsonl", "--labels", f"{d}/labels.jsonl",
                                                  "--out", d, "--test-frac", "0.34"]), 0)
             train, test = common.read_jsonl(f"{d}/train.jsonl"), common.read_jsonl(f"{d}/test.jsonl")
+            val = common.read_jsonl(f"{d}/val.jsonl")
+            self.assertEqual({r["case_id"] for r in val}, {"me/app@" + "c" * 12})
+            with self.assertRaises(SystemExit):
+                evaluate.main(["predict", "--backend", "jev", "--data", f"{d}/test.jsonl", "--out", f"{d}/j.jsonl"])
+            self.assertFalse(os.path.exists(f"{d}/j.sent.jsonl"))
             self.assertEqual({r["case_id"] for r in test}, {"me/app@" + "d" * 12})
             self.assertFalse({r["case_id"] for r in train} & {r["case_id"] for r in test})
             self.assertEqual(set(train[0]) >= {"state", "questions", "expected"}, True)
@@ -165,6 +190,19 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual((b["escalation_missed"], b["escalation_needed"]), (1, 1))
             self.assertEqual((b["top_level_missed"], b["change_under_called"]), (1, 1))
             self.assertIn("| security_review | b |", open(f"{d}/report.md").read())
+
+            # a backend that skipped the change, or an incomplete diff, leaves nothing to score
+            evaluate.main(["report", f"a={d}/a.jsonl", f"none={d}/missing.jsonl", "--data", f"{d}/test.jsonl",
+                           "--changes", f"{d}/test_changes.jsonl", "--out", f"{d}/report2"])
+            self.assertEqual(json.load(open(f"{d}/report2.json"))["a"]["changes_scored"], 0)
+            changes = common.read_jsonl(f"{d}/test_changes.jsonl")
+            changes[0]["units_complete"] = False
+            common.write_jsonl(f"{d}/test_changes.jsonl", changes)
+            evaluate.main(["report", f"b={d}/b.jsonl", "--data", f"{d}/test.jsonl",
+                           "--changes", f"{d}/test_changes.jsonl", "--out", f"{d}/report3"])
+            b3 = json.load(open(f"{d}/report3.json"))["b"]
+            self.assertEqual((b3["changes_scored"], b3["questions"]["security_review"]["escalation_needed"]), (0, 0))
+            self.assertIn("1 changes have an incomplete diff", open(f"{d}/report3.md").read())
 
     def test_normalise_answers(self):
         q = common.load_questions()

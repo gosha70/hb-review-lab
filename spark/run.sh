@@ -3,9 +3,10 @@
 #
 #   spark/run.sh smoke      GPU inference check (the one Laya's docs ask Spark users to run)
 #   spark/run.sh dryrun     validate data/train.jsonl without loading weights
-#   spark/run.sh train      fine-tune, calibrate, and evaluate on data/test.jsonl
+#   spark/run.sh train      fine-tune, calibrate, and score before/after on data/val.jsonl
 #   spark/run.sh predict [checkpoint] [name]
-#                           answer data/test.jsonl; default is the fine-tuned checkpoint.
+#                           answer data/test.jsonl (run once settings are final);
+#                           default is the fine-tuned checkpoint.
 #                           e.g. `spark/run.sh predict english base` for the untuned baseline
 #
 # Needs: Docker with the NVIDIA Container Toolkit, and network access to GitHub and Hugging Face.
@@ -17,7 +18,6 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 export HB_REPO=$(dirname "$HERE")
 export HB_DATA=${HB_DATA:-$HB_REPO/data}
 export HB_OUT=${HB_OUT:-$HB_REPO/out}
-export LAYA_CACHE_VOLUME=${LAYA_CACHE_VOLUME:-hb_laya_model_cache}
 
 LAYA_DIR=${LAYA_DIR:-$HOME/laya}
 LAYA_REF=${LAYA_REF:-b1d656952f0f9581ea691a70cb6f38abf3eb13a9}   # v0.4.35, the revision this was written against
@@ -31,13 +31,15 @@ if [ "$(git -C "$LAYA_DIR" rev-parse HEAD)" != "$LAYA_REF" ]; then
   git -C "$LAYA_DIR" fetch origin "$LAYA_REF"
   git -C "$LAYA_DIR" checkout --detach "$LAYA_REF"
 fi
-mkdir -p "$HB_OUT"
-chmod a+rwx "$HB_OUT"   # the container runs as its own non-root user
+# Run the container as the calling user so out/ keeps ordinary permissions. The image's own
+# user cannot write to a host directory, so HOME and the model cache live under out/ instead.
+mkdir -p "$HB_OUT/.home"
 
 run() {
   docker compose --project-directory "$LAYA_DIR" \
     -f "$LAYA_DIR/compose.yaml" -f "$LAYA_DIR/compose.spark.yaml" -f "$HERE/compose.hb.yaml" \
-    run --build --rm laya "$@"
+    run --build --rm --user "$(id -u):$(id -g)" \
+    -e HOME=/out/.home -e HF_HOME=/out/.home/huggingface laya "$@"
 }
 
 case "${1:-}" in
@@ -63,7 +65,8 @@ print("CUDA inference passed", torch.cuda.max_memory_allocated())
     ;;
   train)
     # shellcheck disable=SC2086
-    run laya-train --data /data/train.jsonl --eval /data/test.jsonl --base "$BASE" \
+    # Before/after numbers come from val.jsonl. test.jsonl is read only by `predict`.
+    run laya-train --data /data/train.jsonl --eval /data/val.jsonl --base "$BASE" \
       --out "/out/$NAME" --max-len "$MAX_LEN" --head-max-len "$HEAD_MAX_LEN" \
       --device cuda ${TRAIN_ARGS:-} 2>&1 | tee "$HB_OUT/$NAME.train.log"
     ;;

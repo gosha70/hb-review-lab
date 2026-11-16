@@ -8,11 +8,13 @@ Runs through the Message Batches API (asynchronous, half price). Labels are appe
 Usage:
     pip install anthropic
     export ANTHROPIC_API_KEY=...
-    python label_changes.py --cases data/cases.jsonl --out data/labels.jsonl --limit 20   # trial
-    python label_changes.py --cases data/cases.jsonl --out data/labels.jsonl
+    python label_changes.py --allow-external anthropic --limit 20   # trial
+    python label_changes.py --allow-external anthropic
 
 Re-running resumes: finished cases are skipped and a submitted batch is picked up again.
-The diffs are sent to the Anthropic API. scrape_changes.py redacts common secret formats first.
+The diffs and review comments are sent to the Anthropic API, so the run must be confirmed with
+--allow-external anthropic. scrape_changes.py redacts common secret formats first; that is a
+safety net, not a guarantee. Every case sent is logged to <out>.sent.jsonl.
 """
 from __future__ import annotations
 
@@ -73,7 +75,7 @@ def schema(questions: dict) -> dict:
     }
 
 
-def prompt(case: dict, units: list[dict], complete: bool) -> str:
+def prompt(case: dict, units: list[dict], incomplete: list[str]) -> str:
     o = case["outcome"]
     parts = [
         f"Repository: {case['repo']}", f"Change: {case['title']}",
@@ -81,8 +83,8 @@ def prompt(case: dict, units: list[dict], complete: bool) -> str:
         "Files:", *[f"  {f['path']} [{f['status']}] +{f['additions']} -{f['deletions']}"
                     + ("" if f.get("patch") else " (no text diff)") for f in case["files"]],
     ]
-    if not complete:
-        parts.append(f"Only the first {len(units)} units are shown; the change is larger.")
+    if incomplete:
+        parts.append(f"Parts of this change are not shown ({', '.join(incomplete)}).")
     parts += ["", "Outcome (hindsight):", f"  signals: {json.dumps(o['observed'])}"]
     parts += [f"  review {r['state']} by {'human' if r['human'] else 'bot/author'}: {r['body'] or ''}"
               for r in o["reviews"]]
@@ -96,13 +98,13 @@ def prompt(case: dict, units: list[dict], complete: bool) -> str:
 
 
 def params(case: dict, questions: dict, model: str, unit_chars: int, max_units: int) -> dict:
-    units, complete = build_units(case, unit_chars, max_units)
+    units, incomplete = build_units(case, unit_chars, max_units)
     return {
         "model": model,
         "max_tokens": 16000,
         "thinking": {"type": "adaptive"},
         "system": SYSTEM.format(rubric=rubric(questions)),
-        "messages": [{"role": "user", "content": prompt(case, units, complete)}],
+        "messages": [{"role": "user", "content": prompt(case, units, incomplete)}],
         "output_config": {"format": {"type": "json_schema", "schema": schema(questions)}},
     }
 
@@ -110,7 +112,7 @@ def params(case: dict, questions: dict, model: str, unit_chars: int, max_units: 
 def parse(text: str, case: dict, questions: dict, unit_chars: int, max_units: int) -> dict:
     """Validate the teacher's JSON against the case's units. Raises ValueError when unusable."""
     data = json.loads(text)
-    units, complete = build_units(case, unit_chars, max_units)
+    units, incomplete = build_units(case, unit_chars, max_units)
 
     def conv(d):
         out = {}
@@ -130,7 +132,8 @@ def parse(text: str, case: dict, questions: dict, unit_chars: int, max_units: in
         "change": conv(data["change"]),
         "units": {u["unit"]: by_unit[u["unit"]] for u in units},
         "rationale": data["rationale"],
-        "units_complete": complete,
+        "units_complete": not incomplete,
+        "incomplete_reasons": incomplete,
     }
 
 
@@ -147,7 +150,15 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=0, help="label at most N new cases (0 = all)")
     ap.add_argument("--unit-chars", type=int, default=UNIT_CHARS)
     ap.add_argument("--max-units", type=int, default=MAX_UNITS)
+    ap.add_argument("--allow-external", choices=["anthropic"],
+                    help="required: confirms these diffs and review comments may be sent to Anthropic")
+    ap.add_argument("--exclude-repo", action="append", default=[],
+                    help="owner/name whose code must never be sent (repeatable)")
     args = ap.parse_args(argv)
+    if args.allow_external != "anthropic":
+        sys.exit("This step sends source diffs and review comments to the Anthropic API.\n"
+                 "Re-run with --allow-external anthropic to confirm, and use --exclude-repo for "
+                 "repositories that must stay local.")
 
     import anthropic
     from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
@@ -159,6 +170,7 @@ def main(argv=None) -> int:
     by_cid = {cid(k): k for k in cases}
     pending_path = Path(args.out).with_suffix(".pending.json")
     errors_path = Path(args.out).with_suffix(".errors.jsonl")
+    sent_path = Path(args.out).with_suffix(".sent.jsonl")
 
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
@@ -202,7 +214,7 @@ def main(argv=None) -> int:
         pending_path.unlink()
 
     done = {r["case_id"] for r in read_jsonl(args.out)}
-    todo = [c for k, c in cases.items() if k not in done]
+    todo = [c for k, c in cases.items() if k not in done and c["repo"] not in set(args.exclude_repo)]
     if args.limit:
         todo = todo[:args.limit]
     log(f"{len(done)} cases already labelled, {len(todo)} to label with {args.model}")
@@ -215,6 +227,9 @@ def main(argv=None) -> int:
                         **params(c, questions, args.model, args.unit_chars, args.max_units)))
             for c in chunk])
         pending_path.write_text(json.dumps([batch.id]))
+        for c in chunk:   # audit trail of what left this machine
+            append_jsonl(sent_path, {"provider": "anthropic", "batch": batch.id, "case_id": c["case_id"],
+                                     "repo": c["repo"], "sent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         log(f"Submitted batch {batch.id} ({len(chunk)} cases)")
         collect(batch.id)
         pending_path.unlink()

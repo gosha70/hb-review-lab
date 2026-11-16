@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 UNIT_CHARS = 1800   # diff characters per unit; sized for a 1,024-token Laya window
-MAX_UNITS = 40      # units per change; larger changes are flagged units_complete=False
+MAX_UNITS = 40      # units per change; larger changes are flagged incomplete
 
 
 # ---------- JSONL ----------
@@ -93,22 +93,25 @@ def _chunks(patch: str, limit: int) -> list[str]:
             cur = hunk
             continue
         for line in hunk.splitlines(keepends=True):
-            if len(line) > limit:
-                line = line[:limit - 20] + " [line cut]\n"
-            if len(cur) + len(line) > limit:
-                out.append(cur)
-                cur = ""
-            cur += line
+            # A line longer than a unit is spread over several units; no text is dropped.
+            for piece in (line[i:i + limit] for i in range(0, len(line), limit)):
+                if cur and len(cur) + len(piece) > limit:
+                    out.append(cur)
+                    cur = ""
+                cur += piece
     if cur:
         out.append(cur)
     return out
 
 
 def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_UNITS):
-    """One classifier input per diff piece. Returns (units, complete).
+    """One classifier input per diff piece. Returns (units, incomplete_reasons).
 
-    A change is never silently truncated: when it needs more than `max_units` units, the first
-    `max_units` are returned with complete=False so callers can treat it as not fully classified.
+    The units cover the whole change only when incomplete_reasons is empty. Reasons:
+      unit_cap           the change needs more than `max_units` units; only the first are returned
+      file_without_diff  GitHub returned no text diff for a file that has line changes (too large)
+      files_not_fetched  the change touches more files than were fetched
+    Callers must treat an incomplete change as not fully classified, never as safe.
     """
     files = case["files"]
     header = (
@@ -117,9 +120,13 @@ def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_U
         f"Description: {(case.get('body') or '').strip()[:300]}\n"
         f"Files changed: {len(files)} "
         f"(+{sum(f['additions'] for f in files)} -{sum(f['deletions'] for f in files)})\n")
-    units = []
+    units, reasons = [], []
+    if case.get("files_total") and case["files_total"] > len(files):
+        reasons.append("files_not_fetched")
     for f in files:
         if not f.get("patch"):
+            if f["additions"] or f["deletions"]:
+                reasons.append("file_without_diff")
             continue
         parts = _chunks(f["patch"], unit_chars)
         for i, part in enumerate(parts, 1):
@@ -128,4 +135,6 @@ def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_U
                 "path": f["path"],
                 "state": f"{header}File: {f['path']} [{f['status']}] part {i}/{len(parts)}\nDiff:\n{part}",
             })
-    return units[:max_units], len(units) <= max_units
+    if len(units) > max_units:
+        reasons.append("unit_cap")
+    return units[:max_units], sorted(set(reasons))

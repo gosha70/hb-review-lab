@@ -1,0 +1,8 @@
+# Adds the hb-review-lab data, output and code mounts to Laya's own Spark services.
+# Used by run.sh together with Laya's compose.yaml and compose.spark.yaml.
+services:
+  laya:
+    volumes:
+      - "${HB_DATA}:/data:ro"
+      - "${HB_OUT}:/out"
+      - "${HB_REPO}:/hb:ro"

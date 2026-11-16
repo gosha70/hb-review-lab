@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# repo_audit.py output (describes private repositories)
+audit_out/
+
+# pipeline data and model outputs (contain private repository content)
+data/
+out/
+
+# which repositories may be sent to which external provider (names private repositories)
+external_allowlist.json

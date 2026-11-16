@@ -1,0 +1,59 @@
+{
+  "risk_score": {
+    "type": "score",
+    "instructions": "How risky is this code change?",
+    "criteria": [
+      "no meaningful risk: docs, comments, formatting, tests only",
+      "low risk: small, local, easily reverted change",
+      "moderate risk: touches shared logic or several modules",
+      "high risk: touches auth, data integrity, public contracts, concurrency or infrastructure",
+      "severe risk: could cause a security breach, data loss or an outage"
+    ]
+  },
+  "criticality": {
+    "type": "choice",
+    "instructions": "How critical is the code this change affects, to the business and the system?",
+    "criteria": {
+      "low": "peripheral code; failure is cosmetic or easily worked around",
+      "medium": "ordinary product code; failure affects some users or one feature",
+      "high": "core functionality or shared components; failure affects many users",
+      "critical": "security, payments, data storage or availability of the whole system"
+    }
+  },
+  "human_review": {
+    "type": "choice",
+    "instructions": "Does this change need a human code review?",
+    "criteria": {
+      "none": "automated checks are sufficient",
+      "recommended": "a human reviewer would add value but is not essential",
+      "required": "a human must review this before it is merged"
+    }
+  },
+  "ux_review": {
+    "type": "choice",
+    "instructions": "Does this change need UX or accessibility review?",
+    "criteria": {
+      "none": "no user-facing behaviour or appearance changes",
+      "automated": "user-facing change that automated UI and accessibility checks can cover",
+      "specialist": "new or changed user journey that a UX specialist should verify"
+    }
+  },
+  "security_review": {
+    "type": "choice",
+    "instructions": "Does this change need security review?",
+    "criteria": {
+      "none": "no security-relevant code or configuration is touched",
+      "automated": "security-relevant, but static analysis and dependency audit are sufficient",
+      "specialist": "authentication, authorization, secrets, crypto, input handling or exposure that a security specialist should review"
+    }
+  },
+  "performance_review": {
+    "type": "choice",
+    "instructions": "Does this change need performance review?",
+    "criteria": {
+      "none": "no plausible effect on performance",
+      "automated": "possible effect that benchmarks or performance regression tests can cover",
+      "specialist": "hot path, query, concurrency or large-data change that needs profiling or load testing"
+    }
+  }
+}

@@ -120,11 +120,13 @@ class AuditTest(unittest.TestCase):
         os.environ["NO_PROXY"] = "127.0.0.1"
         import repo_audit
         cls.mod = repo_audit
+        repo_audit.API = os.environ["GITHUB_API_URL"]
         repo_audit.time.sleep = lambda s: None
 
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()
 
     def run_audit(self, out, *repos):
         args = ["--out", out]

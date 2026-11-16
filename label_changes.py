@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Step 1c: teacher labels. Claude reads each change (prediction view plus outcome view) and
+answers the questions in questions.json for the whole change and for each change unit.
+
+Runs through the Message Batches API (asynchronous, half price). Labels are appended to
+--out with label_source "inferred"; nothing here is human-validated.
+
+Usage:
+    pip install anthropic
+    export ANTHROPIC_API_KEY=...
+    python label_changes.py --cases data/cases.jsonl --out data/labels.jsonl --limit 20   # trial
+    python label_changes.py --cases data/cases.jsonl --out data/labels.jsonl
+
+Re-running resumes: finished cases are skipped and a submitted batch is picked up again.
+The diffs are sent to the Anthropic API. scrape_changes.py redacts common secret formats first.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+from common import MAX_UNITS, UNIT_CHARS, append_jsonl, build_units, load_questions, options, read_jsonl
+
+MODEL = "claude-opus-5-5"
+BATCH_SIZE = 1000
+
+SYSTEM = """You label code changes for a review-routing classifier.
+
+For the change as a whole, and separately for each numbered unit (one piece of the diff), answer
+every question below with exactly one of its options.
+
+Label the change as it was submitted: the risk it carried and the review it needed at that
+moment. The "Outcome" section is hindsight (review comments, CI, reverts). Use it as evidence of
+what the change actually needed, but do not label the later fixes.
+
+A unit's labels describe that unit alone. The change-level label for a question is never lower
+than the highest label among its units.
+
+Questions:
+{rubric}"""
+
+
+def rubric(questions: dict) -> str:
+    lines = []
+    for qid, q in questions.items():
+        lines.append(f"\n{qid}: {q['instructions']}")
+        crit = q["criteria"]
+        items = enumerate(crit) if q["type"] == "score" else crit.items()
+        lines += [f"  {k} = {v}" for k, v in items]
+    return "\n".join(lines)
+
+
+def schema(questions: dict) -> dict:
+    props = {qid: {"type": "string", "enum": [str(o) for o in options(q)]} for qid, q in questions.items()}
+
+    def obj(extra):
+        p = {**extra, **props}
+        return {"type": "object", "properties": p, "required": list(p), "additionalProperties": False}
+
+    return {
+        "type": "object",
+        "properties": {
+            "rationale": {"type": "string"},
+            "change": obj({}),
+            "units": {"type": "array", "items": obj({"unit": {"type": "string"}})},
+        },
+        "required": ["rationale", "change", "units"],
+        "additionalProperties": False,
+    }
+
+
+def prompt(case: dict, units: list[dict], complete: bool) -> str:
+    o = case["outcome"]
+    parts = [
+        f"Repository: {case['repo']}", f"Change: {case['title']}",
+        f"Description:\n{case.get('body') or '(none)'}", "",
+        "Files:", *[f"  {f['path']} [{f['status']}] +{f['additions']} -{f['deletions']}"
+                    + ("" if f.get("patch") else " (no text diff)") for f in case["files"]],
+    ]
+    if not complete:
+        parts.append(f"Only the first {len(units)} units are shown; the change is larger.")
+    parts += ["", "Outcome (hindsight):", f"  signals: {json.dumps(o['observed'])}"]
+    parts += [f"  review {r['state']} by {'human' if r['human'] else 'bot/author'}: {r['body'] or ''}"
+              for r in o["reviews"]]
+    parts += [f"  comment on {c['path']}:{c['line']} by {'human' if c['human'] else 'bot/author'}: {c['body']}"
+              for c in o["review_comments"]]
+    for u in units:
+        body = u["state"].split("\nFile: ", 1)[1]
+        parts += ["", f"=== unit {u['unit']} ===", f"File: {body}"]
+    parts += ["", f"Label the change and each of the {len(units)} units."]
+    return "\n".join(parts)
+
+
+def params(case: dict, questions: dict, model: str, unit_chars: int, max_units: int) -> dict:
+    units, complete = build_units(case, unit_chars, max_units)
+    return {
+        "model": model,
+        "max_tokens": 16000,
+        "thinking": {"type": "adaptive"},
+        "system": SYSTEM.format(rubric=rubric(questions)),
+        "messages": [{"role": "user", "content": prompt(case, units, complete)}],
+        "output_config": {"format": {"type": "json_schema", "schema": schema(questions)}},
+    }
+
+
+def parse(text: str, case: dict, questions: dict, unit_chars: int, max_units: int) -> dict:
+    """Validate the teacher's JSON against the case's units. Raises ValueError when unusable."""
+    data = json.loads(text)
+    units, complete = build_units(case, unit_chars, max_units)
+
+    def conv(d):
+        out = {}
+        for qid, q in questions.items():
+            v = d[qid]
+            v = int(v) if q["type"] == "score" else v
+            if v not in options(q):
+                raise ValueError(f"{qid}: {v!r} is not an option")
+            out[qid] = v
+        return out
+
+    by_unit = {u["unit"]: conv(u) for u in data["units"]}
+    missing = [u["unit"] for u in units if u["unit"] not in by_unit]
+    if missing:
+        raise ValueError(f"no labels for units {missing}")
+    return {
+        "change": conv(data["change"]),
+        "units": {u["unit"]: by_unit[u["unit"]] for u in units},
+        "rationale": data["rationale"],
+        "units_complete": complete,
+    }
+
+
+def cid(case_id: str) -> str:
+    return hashlib.sha1(case_id.encode()).hexdigest()[:40]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--cases", default="data/cases.jsonl")
+    ap.add_argument("--out", default="data/labels.jsonl")
+    ap.add_argument("--questions", default=None)
+    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--limit", type=int, default=0, help="label at most N new cases (0 = all)")
+    ap.add_argument("--unit-chars", type=int, default=UNIT_CHARS)
+    ap.add_argument("--max-units", type=int, default=MAX_UNITS)
+    args = ap.parse_args(argv)
+
+    import anthropic
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request
+
+    client = anthropic.Anthropic()
+    questions = load_questions(args.questions)
+    cases = {c["case_id"]: c for c in read_jsonl(args.cases)}
+    by_cid = {cid(k): k for k in cases}
+    pending_path = Path(args.out).with_suffix(".pending.json")
+    errors_path = Path(args.out).with_suffix(".errors.jsonl")
+
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    def collect(batch_id: str) -> None:
+        while True:
+            batch = client.messages.batches.retrieve(batch_id)
+            if batch.processing_status == "ended":
+                break
+            log(f"  batch {batch_id}: {batch.request_counts.processing} still processing")
+            time.sleep(60)
+        ok = bad = tin = tout = 0
+        for result in client.messages.batches.results(batch_id):
+            case_id = by_cid.get(result.custom_id)
+            if case_id is None:
+                continue
+            try:
+                if result.result.type != "succeeded":
+                    raise ValueError(f"request {result.result.type}")
+                msg = result.result.message
+                tin, tout = tin + msg.usage.input_tokens, tout + msg.usage.output_tokens
+                if msg.stop_reason != "end_turn":
+                    raise ValueError(f"stop_reason {msg.stop_reason}")
+                text = next(b.text for b in msg.content if b.type == "text")
+                labels = parse(text, cases[case_id], questions, args.unit_chars, args.max_units)
+            except (ValueError, KeyError, StopIteration) as e:
+                append_jsonl(errors_path, {"case_id": case_id, "error": str(e)})
+                bad += 1
+                continue
+            append_jsonl(args.out, {
+                "case_id": case_id, "label_source": "inferred", "teacher": args.model,
+                "unit_chars": args.unit_chars, "max_units": args.max_units, **labels,
+            })
+            ok += 1
+        log(f"  batch {batch_id}: {ok} labelled, {bad} failed, {tin} input / {tout} output tokens")
+
+    if pending_path.exists():
+        for batch_id in json.loads(pending_path.read_text()):
+            log(f"Resuming batch {batch_id}")
+            collect(batch_id)
+        pending_path.unlink()
+
+    done = {r["case_id"] for r in read_jsonl(args.out)}
+    todo = [c for k, c in cases.items() if k not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    log(f"{len(done)} cases already labelled, {len(todo)} to label with {args.model}")
+
+    for start in range(0, len(todo), BATCH_SIZE):
+        chunk = todo[start:start + BATCH_SIZE]
+        batch = client.messages.batches.create(requests=[
+            Request(custom_id=cid(c["case_id"]),
+                    params=MessageCreateParamsNonStreaming(
+                        **params(c, questions, args.model, args.unit_chars, args.max_units)))
+            for c in chunk])
+        pending_path.write_text(json.dumps([batch.id]))
+        log(f"Submitted batch {batch.id} ({len(chunk)} cases)")
+        collect(batch.id)
+        pending_path.unlink()
+    if errors_path.exists():
+        log(f"Failures are listed in {errors_path}; re-run to retry them.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

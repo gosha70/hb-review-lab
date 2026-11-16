@@ -80,7 +80,7 @@ query($owner:String!,$name:String!,$cursor:String){
   rateLimit{remaining resetAt}
   repository(owner:$owner,name:$name){
     isPrivate isArchived primaryLanguage{name}
-    pullRequests(first:50, after:$cursor, orderBy:{field:CREATED_AT,direction:ASC}){
+    pullRequests(first:50, after:$cursor, orderBy:{field:CREATED_AT,direction:DESC}){
       totalCount pageInfo{hasNextPage endCursor}
       nodes{
         number title createdAt mergedAt state additions deletions changedFiles
@@ -240,7 +240,8 @@ class Store:
         tmp.replace(self.state_path)
 
 
-def collect_paged(store: Store, token: str, repo: str, kind: str, query: str, pick) -> None:
+def collect_paged(store: Store, token: str, repo: str, kind: str, query: str, pick, limit: int = 0) -> None:
+    """Page newest-first; stop after `limit` items when limit > 0."""
     st = store.get(repo, kind)
     owner, name = repo.split("/", 1)
     while not st["done"]:
@@ -261,7 +262,8 @@ def collect_paged(store: Store, token: str, repo: str, kind: str, query: str, pi
             store.append(repo, kind, page["nodes"])
             st["total"] = page["totalCount"]
             st["cursor"] = page["pageInfo"]["endCursor"]
-            st["done"] = not page["pageInfo"]["hasNextPage"]
+            st["n"] = st.get("n", 0) + len(page["nodes"])
+            st["done"] = not page["pageInfo"]["hasNextPage"] or bool(limit and st["n"] >= limit)
         store.save()
 
 
@@ -466,6 +468,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--commit-files", type=int, default=300,
                     help="per repository, fetch file paths for up to N direct commits "
                          "(one request each; 0 disables). Default 300.")
+    ap.add_argument("--max-prs", type=int, default=0,
+                    help="per repository, stop after about N newest PRs (0 = all). "
+                         "Use for large public repositories.")
+    ap.add_argument("--max-commits", type=int, default=0,
+                    help="per repository, stop after about N newest commits (0 = all)")
     args = ap.parse_args(argv)
 
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -488,10 +495,11 @@ def main(argv: list[str] | None = None) -> int:
     for i, repo in enumerate(repos, 1):
         log(f"[{i}/{len(repos)}] {repo}")
         try:
-            collect_paged(store, token, repo, "prs", PRS_Q, lambda r: r["pullRequests"])
+            collect_paged(store, token, repo, "prs", PRS_Q, lambda r: r["pullRequests"], args.max_prs)
             collect_paged(
                 store, token, repo, "commits", COMMITS_Q,
-                lambda r: r["defaultBranchRef"]["target"]["history"] if r["defaultBranchRef"] else None)
+                lambda r: r["defaultBranchRef"]["target"]["history"] if r["defaultBranchRef"] else None,
+                args.max_commits)
             collect_commit_files(store, token, repo, args.commit_files)
         except RepoUnavailable as e:
             log(f"  skipped: {e}")

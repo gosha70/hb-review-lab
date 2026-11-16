@@ -181,3 +181,7 @@ cython_debug/
 .cursorindexingignore
 # repo_audit.py output (describes private repositories)
 audit_out/
+
+# pipeline data and model outputs (contain private repository content)
+data/
+out/

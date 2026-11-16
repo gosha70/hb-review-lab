@@ -15,7 +15,7 @@ export GITHUB_TOKEN=...
 
 # 1a. Inventory: every PR and default-branch commit, with review/CI/revert signals
 python repo_audit.py --owner <login> --out audit_out
-python repo_audit.py --repo django/django --repo grafana/grafana --max-prs 500 --max-commits 0 --out audit_out
+python repo_audit.py --repo django/django --repo grafana/grafana --max-prs 500 --max-commits 1000 --out audit_out
 
 # 1b. Diffs and review outcomes for those changes (secrets redacted)
 python scrape_changes.py --candidates audit_out/candidates.jsonl --out data/cases.jsonl
@@ -30,6 +30,11 @@ python label_changes.py --allow-external anthropic
 # 1d. Laya train/val/test files, split by time within each repository
 python build_dataset.py --out data
 ```
+
+For a public repository always set both limits. `--max-commits 0` means the whole history,
+which for an old project includes thousands of commits from before it used pull requests. Runs
+for different repositories add to the same `audit_out/`; a repository already collected is not
+fetched again, so use a new `--out` to change its limits.
 
 Every step resumes if interrupted. Results land in `audit_out/` and `data/`, both git-ignored
 because they contain repository content.
@@ -61,13 +66,30 @@ How the data is shaped:
   redaction covers common key formats only; treat it as a safety net.
 - Each case records `written_by` for the revision being classified: an AI coding agent named
   in its commit trailers, `mixed` when only some commits are marked or agents differ,
-  `unmarked` when there is no marker (which does not prove a human wrote it), or `unknown`
+  `unmarked` when there is no marker, or `unknown`
   when the revision's commits could not be determined. `written_by_evidence` lists the markers.
+  Many agent-written commits carry no marker at all, so `unmarked` is not "human": in a
+  repository built with an AI agent it mostly means "agent, without a marker". The by-author
+  tables compare marked with unmarked changes; they cannot be read as AI versus human.
+- Labels record a fingerprint of `questions.json`. If the questions change after labeling,
+  `build_dataset.py` refuses the old labels instead of training on answers to different
+  questions.
 - A change with no readable diff at all (binary-only, for example) is kept as an incomplete
   case with no units, so it appears in coverage and escalation counts.
 - Labels are `label_source: "inferred"`: the teacher's judgement, not human-validated.
 
 ## 2. Train Laya on the DGX Spark
+
+`spark/run.sh` reads `data/` and writes `out/` inside this repository's checkout on the Spark.
+Either run step 1 on the Spark as well, or copy the dataset over and the results back:
+
+```bash
+rsync -av data/train.jsonl data/val.jsonl data/test.jsonl data/test_changes.jsonl data/majority.json <spark>:hb-review-lab/data/
+rsync -av <spark>:hb-review-lab/out/ out/     # after step 3, for the report
+```
+
+The predictions and `evaluate.py report` need `data/test.jsonl`, `data/test_changes.jsonl` and
+`data/majority.json` on whichever machine writes the report.
 
 Needs Docker with the NVIDIA Container Toolkit. `spark/run.sh` clones Laya at a pinned revision
 and uses its own ARM64 / CUDA 13.0 container (`compose.spark.yaml`), adding mounts for `data/`
@@ -130,6 +152,33 @@ If Claude answers lower than the second teacher more often on Claude-written cha
 unmarked ones, that is a reason to look closer. It is not proof of self-preference: the gap can
 come from ordinary model differences, and the two groups are not matched by repository, date,
 size or risk. Confirming it needs matched cases and independently reviewed labels.
+
+## First run: a pilot through every step
+
+None of the external paths (GitHub, the teacher APIs, the Spark, Jev) is covered by the offline
+tests. Before the full run, take about 20 changes through **every** step, including training,
+prediction and the report. The numbers will mean nothing at this size; the point is to find
+integration failures while they are cheap.
+
+```bash
+python repo_audit.py --owner <login> --out audit_out
+python scrape_changes.py --max-per-repo 5 --out data/cases.jsonl
+python label_changes.py --allow-external anthropic --limit 20
+python build_dataset.py --out data
+spark/run.sh smoke
+spark/run.sh dryrun
+TRAIN_ARGS="--epochs 1" NAME=pilot spark/run.sh train
+NAME=pilot spark/run.sh predict
+spark/run.sh predict english base
+python evaluate.py predict --backend jev --allow-external typesafe --out out/pred.jev.jsonl
+python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl jev=out/pred.jev.jsonl
+```
+
+Expect `laya-train` to warn that calibration was not fitted on so few rows. The pilot passes
+when every command finishes, the report lists a row per backend, and a few labels read against
+their diffs look sensible. Then remove the limits and re-run steps 1b to 1d; they resume from
+what the pilot already fetched and labeled. Delete `out/pilot` and `out/pred.*.jsonl` before the
+real run so pilot predictions are not mixed into it.
 
 ## Tests
 

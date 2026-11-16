@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-from common import MAX_UNITS, UNIT_CHARS, allowed_repos, append_jsonl, build_units, load_questions, read_jsonl
+from common import MAX_UNITS, UNIT_CHARS, allowed_repos, append_jsonl, build_units, load_questions, questions_sha, read_jsonl
 from label_changes import SYSTEM, parse, prompt, rubric, schema
 
 
@@ -99,6 +99,7 @@ def main(argv=None) -> int:
             bad += 1
             continue
         append_jsonl(args.out, {"case_id": c["case_id"], "label_source": "inferred", "teacher": args.model,
+                                "questions_sha": questions_sha(questions),
                                 "unit_chars": f["unit_chars"], "max_units": f["max_units"], **labels})
         ok += 1
     print(f"{ok} labelled, {bad} failed" + (f" (see {errors_path})" if bad else ""), file=sys.stderr)

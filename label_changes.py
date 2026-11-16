@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 from common import (MAX_UNITS, UNIT_CHARS, allowed_repos, append_jsonl, build_units, load_questions,
-                    options, read_jsonl)
+                    options, questions_sha, read_jsonl)
 
 MODEL = "claude-opus-5-5"
 BATCH_SIZE = 1000
@@ -209,6 +209,7 @@ def main(argv=None) -> int:
                 continue
             append_jsonl(args.out, {
                 "case_id": case_id, "label_source": "inferred", "teacher": args.model,
+                "questions_sha": questions_sha(questions),
                 "unit_chars": args.unit_chars, "max_units": args.max_units, **labels,
             })
             ok += 1

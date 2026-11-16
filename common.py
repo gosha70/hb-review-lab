@@ -325,3 +325,9 @@ def attribute(commits: list[tuple[str, str]] | None, *other: tuple[str, str | No
     if len(agents) > 1 or partly_marked:
         return "mixed", evidence
     return agents.pop(), evidence
+
+
+def questions_sha(questions: dict) -> str:
+    """Fingerprint of a question set. Labels made under one set are not valid under another."""
+    import hashlib
+    return hashlib.sha256(json.dumps(questions, sort_keys=False, ensure_ascii=False).encode()).hexdigest()[:16]

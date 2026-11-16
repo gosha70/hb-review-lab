@@ -237,6 +237,9 @@ def cmd_teachers(args) -> int:
     la = {r["case_id"]: r["change"] for r in read_jsonl(pa)}
     lb = {r["case_id"]: r["change"] for r in read_jsonl(pb)}
     author = {c["case_id"]: c.get("written_by", "unmarked") for c in read_jsonl(args.cases)}
+    shas = {r.get("questions_sha") for p in (pa, pb) for r in read_jsonl(p)}
+    if len(shas) > 1:
+        sys.exit("The two label files were made with different questions.json versions; they cannot be compared.")
     both = sorted(set(la) & set(lb))
     if not both:
         sys.exit("The two label files share no cases.")

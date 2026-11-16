@@ -161,6 +161,17 @@ class AuditTest(unittest.TestCase):
             self.assertTrue(pr1["observed"]["reverted"])
             self.assertIn("me/gone", open(f"{out}/summary.md").read())
 
+    def test_second_run_for_other_repos_keeps_the_first_runs_candidates(self):
+        with tempfile.TemporaryDirectory() as out:
+            self.run_audit(out, "me/app")
+            first = [json.loads(l) for l in open(f"{out}/candidates.jsonl")]
+            self.run_audit(out, "me/other")            # e.g. adding a public repository later
+            cands = [json.loads(l) for l in open(f"{out}/candidates.jsonl")]
+            self.assertEqual({c["repo"] for c in cands}, {"me/app", "me/other"})
+            self.assertEqual([c for c in cands if c["repo"] == "me/app"], first)
+            rows = [r["repo"] for r in csv.DictReader(open(f"{out}/repos.csv"))]
+            self.assertEqual(rows, ["me/app", "me/other"])
+
     def test_resume_skips_finished_pages(self):
         with tempfile.TemporaryDirectory() as out:
             self.run_audit(out, "me/app")

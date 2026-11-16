@@ -26,7 +26,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from common import (MAX_UNITS, UNIT_CHARS, build_units, load_questions, options, read_jsonl, unread_files,
+from common import (MAX_UNITS, UNIT_CHARS, build_units, load_questions, options, questions_sha, read_jsonl, unread_files,
                     write_jsonl)
 
 
@@ -81,6 +81,14 @@ def main(argv=None) -> int:
 
     questions = load_questions(args.questions)
     labels = {l["case_id"]: l for l in read_jsonl(args.labels)}
+    # Labels answer the questions as they were when the teacher ran. If questions.json has
+    # changed since (wording, options or order), those labels no longer mean the same thing.
+    sha = questions_sha(questions)
+    stale = [k for k, l in labels.items() if l.get("questions_sha") != sha]
+    if stale:
+        sys.exit(f"{len(stale)} of {len(labels)} labels in {args.labels} were made with a different "
+                 f"questions.json (current fingerprint {sha}).\n"
+                 "Label again into a new file, or restore the questions file the labels were made with.")
     # A change with no readable diff has no units and so no teacher labels. It is kept as an
     # incomplete case so it shows up in coverage and escalation counts.
     cases = []

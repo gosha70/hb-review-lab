@@ -11,7 +11,9 @@ Usage:
     python repo_audit.py --owner LOGIN --out audit_out
     python repo_audit.py --repos-file repos.txt --out audit_out   # owner/name per line
 
-Re-running with the same --out resumes where it stopped.
+Re-running with the same --out resumes where it stopped, and runs for different repositories
+add to the same outputs. A repository already collected is not fetched again, so to change its
+--max-prs or --max-commits use a new --out.
 
 Outputs (in --out):
     repos.csv         one row per repository
@@ -453,7 +455,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="per repository, stop after about N newest PRs (0 = all). "
                          "Use for large public repositories.")
     ap.add_argument("--max-commits", type=int, default=0,
-                    help="per repository, stop after about N newest commits (0 = all)")
+                    help="per repository, stop after about N newest commits. 0 = the whole history, "
+                         "including everything from before the repository used pull requests; "
+                         "set a limit for large public repositories.")
     args = ap.parse_args(argv)
 
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -489,6 +493,18 @@ def main(argv: list[str] | None = None) -> int:
         row, cands = analyse(store, repo)
         rows.append(row)
         all_cands += cands
+
+    # Repositories audited into this --out by earlier runs stay in the outputs. Without this a
+    # second run (for example one adding public repositories) would replace the candidate list.
+    earlier = [r for r, st in store.state.items() if r not in repos
+               and st.get("prs", {}).get("done") and st.get("commits", {}).get("done")]
+    for repo in sorted(earlier):
+        row, cands = analyse(store, repo)
+        rows.append(row)
+        all_cands += cands
+    if earlier:
+        log(f"Kept {len(earlier)} repositories from earlier runs: {', '.join(sorted(earlier))}")
+    rows.sort(key=lambda r: r["repo"])
 
     if rows:
         with (out / "repos.csv").open("w", newline="") as f:

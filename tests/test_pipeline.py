@@ -254,7 +254,7 @@ class PipelineTest(unittest.TestCase):
                 units, _ = common.build_units(c)
                 lab = label_changes.parse(teacher_answer(units), c, questions, 1800, 40)
                 self.assertEqual(lab["change"]["risk_score"], 3)
-                common.append_jsonl(f"{d}/labels.jsonl", {"case_id": c["case_id"], "unit_chars": 1800,
+                common.append_jsonl(f"{d}/labels.jsonl", {"case_id": c["case_id"], "unit_chars": 1800, "questions_sha": common.questions_sha(questions),
                                                           "max_units": 40, **lab})
             with self.assertRaises(ValueError):
                 label_changes.parse(teacher_answer([]), pr, questions, 1800, 40)
@@ -269,6 +269,14 @@ class PipelineTest(unittest.TestCase):
             self.assertTrue(req["response_format"]["json_schema"]["strict"])
             self.assertEqual([c["case_id"] for c in label_second_teacher.select(cases, control=1)],
                              ["me/app#1", "me/app@" + "d" * 12])   # the AI-written one + newest unmarked
+
+            # labels made under a different question set are refused
+            changed = {**questions, "ux_review": {**questions["ux_review"], "instructions": "Reworded?"}}
+            Path(f"{d}/q2.json").write_text(json.dumps(changed))
+            with self.assertRaises(SystemExit):
+                build_dataset.main(["--cases", f"{d}/cases.jsonl", "--labels", f"{d}/labels.jsonl",
+                                    "--questions", f"{d}/q2.json", "--out", f"{d}/stale"])
+            self.assertFalse(os.path.exists(f"{d}/stale/train.jsonl"))
 
             # dataset: newest change of the repo is held out; rows are in Laya's format
             self.assertEqual(build_dataset.main(["--cases", f"{d}/cases.jsonl", "--labels", f"{d}/labels.jsonl",
@@ -311,7 +319,8 @@ class PipelineTest(unittest.TestCase):
             for c in cases:
                 units, _ = common.build_units(c)
                 lab = label_changes.parse(teacher_answer(units, "automated", "automated"), c, questions, 1800, 40)
-                common.append_jsonl(f"{d}/labels2.jsonl", {"case_id": c["case_id"], **lab})
+                common.append_jsonl(f"{d}/labels2.jsonl", {"case_id": c["case_id"],
+                                                           "questions_sha": common.questions_sha(questions), **lab})
             evaluate.main(["teachers", f"claude={d}/labels.jsonl", f"other={d}/labels2.jsonl",
                            "--cases", f"{d}/cases.jsonl", "--out", f"{d}/teachers"])
             t = json.load(open(f"{d}/teachers.json"))
@@ -399,7 +408,7 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(common.build_units(binary), ([], ["unreadable_file"]))   # kept, with no units
             units, _ = common.build_units(normal)
             common.append_jsonl(f"{d}/labels.jsonl", {
-                "case_id": normal["case_id"], "unit_chars": 1800, "max_units": 40,
+                "case_id": normal["case_id"], "unit_chars": 1800, "questions_sha": common.questions_sha(questions), "max_units": 40,
                 **label_changes.parse(teacher_answer(units), normal, questions, 1800, 40)})
             build_dataset.main(["--cases", f"{d}/cases.jsonl", "--labels", f"{d}/labels.jsonl", "--out", d,
                                 "--holdout-repo", "me/app"])

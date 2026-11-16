@@ -109,8 +109,9 @@ def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_U
 
     The units cover the whole change only when incomplete_reasons is empty. Reasons:
       unit_cap           the change needs more than `max_units` units; only the first are returned
-      file_without_diff  GitHub returned no text diff for a file that has line changes (too large)
-      files_not_fetched  the change touches more files than were fetched
+      file_without_diff  a file has line changes but GitHub returned no text diff (too large)
+      unreadable_file    a file changed with no readable diff at all (binary, or empty)
+      files_not_fetched  the revision that was retrieved has more files than were fetched
     Callers must treat an incomplete change as not fully classified, never as safe.
     """
     files = case["files"]
@@ -121,12 +122,14 @@ def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_U
         f"Files changed: {len(files)} "
         f"(+{sum(f['additions'] for f in files)} -{sum(f['deletions'] for f in files)})\n")
     units, reasons = [], []
-    if case.get("files_total") and case["files_total"] > len(files):
+    if case.get("files_complete") is False:
         reasons.append("files_not_fetched")
     for f in files:
         if not f.get("patch"):
             if f["additions"] or f["deletions"]:
                 reasons.append("file_without_diff")
+            elif f["status"] != "renamed":      # a pure rename changes no content
+                reasons.append("unreadable_file")
             continue
         parts = _chunks(f["patch"], unit_chars)
         for i, part in enumerate(parts, 1):
@@ -138,3 +141,57 @@ def build_units(case: dict, unit_chars: int = UNIT_CHARS, max_units: int = MAX_U
     if len(units) > max_units:
         reasons.append("unit_cap")
     return units[:max_units], sorted(set(reasons))
+
+
+def unread_files(case: dict) -> list[str]:
+    """Paths whose content change could not be read (no text diff)."""
+    return [f["path"] for f in case["files"]
+            if not f.get("patch") and (f["additions"] or f["deletions"] or f["status"] != "renamed")]
+
+
+# ---------- external-provider allowlist ----------
+
+def allowed_repos(provider: str, path) -> set[str]:
+    """Repositories whose code may be sent to `provider`, from the allowlist file.
+
+    The file maps a provider name to the exact owner/name repositories it may receive:
+        {"anthropic": ["me/app", "django/django"], "typesafe": ["django/django"]}
+    There are no wildcards. A repository that is not listed is never sent.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(
+            f"No external-provider allowlist at {p}.\n"
+            f"Create it (see external_allowlist.example.json) listing the repositories whose code "
+            f"may be sent to {provider}.")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    repos = data.get(provider, [])
+    if not isinstance(repos, list) or any(not isinstance(r, str) or "*" in r or "/" not in r for r in repos):
+        raise SystemExit(f"{p}: '{provider}' must be a list of exact owner/name repositories (no wildcards).")
+    return set(repos)
+
+
+# ---------- authorship ----------
+
+_AI_MARKERS = {
+    "claude": r"co-authored-by:\s*claude|generated with \[?claude code|noreply@anthropic\.com|claude\.ai/code",
+    "copilot": r"co-authored-by:\s*copilot|copilot-swe-agent|copilot@users\.noreply",
+    "codex": r"co-authored-by:\s*codex|chatgpt\.com/codex|openai codex|chatgpt-codex-connector",
+    "cursor": r"co-authored-by:\s*cursor|cursoragent",
+    "aider": r"co-authored-by:\s*aider|\(aider\)|^aider:",
+    "devin": r"devin-ai-integration|co-authored-by:\s*devin",
+    "gemini": r"co-authored-by:\s*gemini|gemini-cli|google-labs-jules",
+}
+_AI_MARKERS = {k: re.compile(v, re.I | re.M) for k, v in _AI_MARKERS.items()}
+
+
+def written_by(*texts: str | None) -> str:
+    """The AI coding agent named in commit trailers, PR text or author login, else "unmarked".
+
+    "unmarked" means no marker was found. It does not prove a human wrote the change.
+    """
+    blob = "\n".join(t for t in texts if t)
+    for agent, rx in _AI_MARKERS.items():
+        if rx.search(blob):
+            return agent
+    return "unmarked"

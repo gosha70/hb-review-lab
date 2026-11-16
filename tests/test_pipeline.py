@@ -14,6 +14,7 @@ import build_dataset
 import common
 import evaluate
 import label_changes
+import label_second_teacher
 
 PATCH = "@@ -1,2 +1,3 @@\n context\n+token = 'abcdefgh12345678'\n" + "@@ -9,1 +10,2 @@\n+more\n" * 3
 OBS = {"human_reviews": 1, "human_inline_comments": 1, "changes_requested": True, "bot_reviews": 0,
@@ -42,6 +43,8 @@ class FakeGitHub(BaseHTTPRequestHandler):
         elif p.endswith("/comments"):
             body = [{"path": "src/auth.py", "line": 2, "user": {"login": "bob", "type": "User"},
                      "body": "hard-coded token"}]
+        elif p.endswith("/pulls/1/commits"):
+            body = [{"commit": {"message": "Add login\n\nCo-Authored-By: Claude <noreply@anthropic.com>"}}]
         elif "/compare/" in p:
             body = {"files": f}
         elif p.endswith("/files"):
@@ -112,9 +115,30 @@ class PipelineTest(unittest.TestCase):
         big = {"path": "big.sql", "status": "modified", "additions": 9000, "deletions": 0, "patch": None}
         binary = {"path": "logo.png", "status": "added", "additions": 0, "deletions": 0, "patch": None}
         base = {"repo": "r", "title": "t", "body": ""}
-        self.assertEqual(common.build_units({**base, "files": [ok, binary]})[1], [])
+        renamed = {"path": "b.py", "status": "renamed", "additions": 0, "deletions": 0, "patch": None}
+        self.assertEqual(common.build_units({**base, "files": [ok, renamed]})[1], [])
         self.assertEqual(common.build_units({**base, "files": [ok, big]})[1], ["file_without_diff"])
-        self.assertEqual(common.build_units({**base, "files": [ok], "files_total": 400})[1], ["files_not_fetched"])
+        # a zero-line binary change is not "fully analysed"
+        self.assertEqual(common.build_units({**base, "files": [ok, binary]})[1], ["unreadable_file"])
+        self.assertEqual(common.unread_files({**base, "files": [ok, renamed, big, binary]}), ["big.sql", "logo.png"])
+        self.assertEqual(common.build_units({**base, "files": [ok], "files_complete": False})[1],
+                         ["files_not_fetched"])
+        self.assertEqual(common.build_units({**base, "files": [ok], "files_complete": True})[1], [])
+
+    def test_allowlist_is_explicit(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit):
+                common.allowed_repos("anthropic", f"{d}/missing.json")
+            Path(f"{d}/a.json").write_text(json.dumps({"anthropic": ["me/app"], "typesafe": ["me/*"]}))
+            self.assertEqual(common.allowed_repos("anthropic", f"{d}/a.json"), {"me/app"})
+            self.assertEqual(common.allowed_repos("openai", f"{d}/a.json"), set())   # unlisted provider: nothing
+            with self.assertRaises(SystemExit):
+                common.allowed_repos("typesafe", f"{d}/a.json")                     # wildcards refused
+
+    def test_written_by(self):
+        self.assertEqual(common.written_by("alice", "Fix\n\nCo-Authored-By: Claude <noreply@anthropic.com>"), "claude")
+        self.assertEqual(common.written_by("copilot-swe-agent[bot]", None), "copilot")
+        self.assertEqual(common.written_by("alice", "Fix the claude prompt docs"), "unmarked")
 
     def test_redact(self):
         out = common.redact("password = 'hunter2hunter2'\nkey AKIAABCDEFGHIJKLMNOP\nx = 1")
@@ -125,7 +149,8 @@ class PipelineTest(unittest.TestCase):
     def test_end_to_end(self):
         questions = common.load_questions()
         with tempfile.TemporaryDirectory() as d:
-            cands = [cand("pr", 1, "2026-01-01T00:00:00Z", body_edited_at="2026-01-03T00:00:00Z"),
+            cands = [cand("pr", 1, "2026-01-01T00:00:00Z", body_edited_at="2026-01-03T00:00:00Z",
+                          changed_files=400),
                      cand("commit", "c" * 40, "2026-02-01T00:00:00Z"),
                      cand("commit", "d" * 40, "2026-03-01T00:00:00Z"),
                      cand("commit", "e" * 40, "2026-04-01T00:00:00Z", author_is_bot=True)]
@@ -138,6 +163,12 @@ class PipelineTest(unittest.TestCase):
             pr = next(c for c in cases if c["kind"] == "pr")
             self.assertEqual(pr["diff_source"], "at_first_review")
             self.assertEqual((pr["body"], pr["body_source"]), ("", "omitted_edited_after_first_review"))
+            # completeness follows the snapshot that was retrieved, not the final PR's 400 files;
+            # the snapshot's binary file is what makes it incomplete
+            self.assertTrue(pr["files_complete"])
+            self.assertEqual(common.build_units(pr)[1], ["unreadable_file"])
+            self.assertEqual(pr["written_by"], "claude")
+            self.assertEqual({c["written_by"] for c in cases if c["kind"] == "commit"}, {"unmarked"})
             self.assertNotIn("abcdefgh12345678", pr["files"][0]["patch"])
             self.assertEqual(pr["outcome"]["review_comments"][0]["body"], "hard-coded token")
             self.assertNotIn("outcome", json.dumps({k: v for k, v in pr.items() if k != "outcome"}))
@@ -157,6 +188,15 @@ class PipelineTest(unittest.TestCase):
                 label_changes.parse(teacher_answer([]), pr, questions, 1800, 40)
             with self.assertRaises(SystemExit):      # nothing is sent without explicit confirmation
                 label_changes.main(["--cases", f"{d}/cases.jsonl", "--out", f"{d}/x.jsonl"])
+            with self.assertRaises(SystemExit):      # ... nor without an allowlist file
+                label_changes.main(["--cases", f"{d}/cases.jsonl", "--out", f"{d}/x.jsonl",
+                                    "--allow-external", "anthropic", "--allowlist", f"{d}/none.json"])
+            with self.assertRaises(SystemExit):
+                label_second_teacher.main(["--model", "m", "--cases", f"{d}/cases.jsonl"])
+            req = label_second_teacher.request(pr, questions, "m", 1800, 40)
+            self.assertTrue(req["response_format"]["json_schema"]["strict"])
+            self.assertEqual([c["case_id"] for c in label_second_teacher.select(cases, control=1)],
+                             ["me/app#1", "me/app@" + "d" * 12])   # the AI-written one + newest unmarked
 
             # dataset: newest change of the repo is held out; rows are in Laya's format
             self.assertEqual(build_dataset.main(["--cases", f"{d}/cases.jsonl", "--labels", f"{d}/labels.jsonl",
@@ -172,6 +212,20 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(set(train[0]) >= {"state", "questions", "expected"}, True)
             self.assertNotIn("hard-coded token", train[0]["state"])   # outcome never reaches the input
             self.assertEqual(train[0]["expected"]["security_review"], "specialist")
+            self.assertIn("by:claude", train[0]["tags"])
+            tc = common.read_jsonl(f"{d}/test_changes.jsonl")[0]
+            self.assertEqual((tc["written_by"], tc["unread_files"], tc["units_complete"]), ("unmarked", [], True))
+
+            # two teachers: the second rates security lower on every change
+            for c in cases:
+                units, _ = common.build_units(c)
+                lab = label_changes.parse(teacher_answer(units, "automated", "automated"), c, questions, 1800, 40)
+                common.append_jsonl(f"{d}/labels2.jsonl", {"case_id": c["case_id"], **lab})
+            evaluate.main(["teachers", f"claude={d}/labels.jsonl", f"other={d}/labels2.jsonl",
+                           "--cases", f"{d}/cases.jsonl", "--out", f"{d}/teachers"])
+            t = json.load(open(f"{d}/teachers.json"))
+            self.assertEqual(t["security_review"]["claude"], {"changes": 1, "agree": 0.0, "a_lower": 0.0, "a_higher": 1.0})
+            self.assertEqual(t["risk_score"]["unmarked"]["agree"], 1.0)
 
             # report: backend A agrees with the teacher, backend B misses the escalation
             def preds(path, sec):
@@ -203,6 +257,21 @@ class PipelineTest(unittest.TestCase):
             b3 = json.load(open(f"{d}/report3.json"))["b"]
             self.assertEqual((b3["changes_scored"], b3["questions"]["security_review"]["escalation_needed"]), (0, 0))
             self.assertIn("1 changes have an incomplete diff", open(f"{d}/report3.md").read())
+
+            # a unit the model truncated: the change is not scored and is reported for escalation
+            changes[0]["units_complete"] = True
+            common.write_jsonl(f"{d}/test_changes.jsonl", changes)
+            rows = common.read_jsonl(f"{d}/a.jsonl")
+            rows[0]["truncated"] = True
+            common.write_jsonl(f"{d}/trunc.jsonl", rows)
+            evaluate.main(["report", f"t={d}/trunc.jsonl", f"b={d}/b.jsonl", "--data", f"{d}/test.jsonl",
+                           "--changes", f"{d}/test_changes.jsonl", "--out", f"{d}/report4"])
+            r4 = json.load(open(f"{d}/report4.json"))
+            self.assertEqual((r4["t"]["units_truncated"], r4["t"]["changes_truncated"]), (1, 1))
+            self.assertEqual((r4["t"]["changes_scored"], r4["b"]["changes_scored"]), (0, 0))  # same set for both
+            self.assertEqual(r4["b"]["changes_truncated"], 0)
+            self.assertIsNone(r4["t"]["questions"]["security_review"]["unit_accuracy"])  # truncated unit excluded
+            self.assertIn("1 complete changes had a unit that a backend truncated", open(f"{d}/report4.md").read())
 
     def test_normalise_answers(self):
         q = common.load_questions()

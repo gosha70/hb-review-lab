@@ -21,6 +21,7 @@ python repo_audit.py --repo django/django --repo grafana/grafana --max-prs 500 -
 python scrape_changes.py --candidates audit_out/candidates.jsonl --out data/cases.jsonl
 
 # 1c. Teacher labels from Claude (Batches API). Try 20 cases first.
+cp external_allowlist.example.json external_allowlist.json   # then list the repositories you allow
 pip install anthropic
 export ANTHROPIC_API_KEY=...
 python label_changes.py --allow-external anthropic --limit 20
@@ -37,16 +38,20 @@ How the data is shaped:
 
 - A change is cut into **units** (pieces of one file's diff, about 1,800 characters) so each
   fits Laya's context window. Nothing is dropped silently: a change is marked
-  `units_complete: false`, with the reason, when it needs more than 40 units, when GitHub
-  returned no diff for a changed file, or when not all of its files were fetched.
+  `units_complete: false`, with the reason, when it needs more than 40 units, when a changed
+  file has no readable diff (too large, or binary), or when not all files of the retrieved
+  revision were fetched.
 - Each case keeps a **prediction view** (title, description, diff) apart from an **outcome
   view** (review comments, CI, reverts). Only the teacher sees the outcome view.
 - For a reviewed PR the diff is the one that stood at the first human review, when GitHub still
   has that commit (`diff_source` records which). GitHub keeps only the current PR description,
   so one edited after the first review is left out (`body_source`).
-- Sending code out needs an explicit flag (`--allow-external`), repositories can be kept local
-  with `--exclude-repo`, and every case sent is logged to a `.sent.jsonl` file. Secret redaction
-  covers common key formats only; treat it as a safety net.
+- Sending code out needs an explicit flag (`--allow-external <provider>`) and an allowlist:
+  `external_allowlist.json` names, per provider, the exact repositories whose code may be sent.
+  Anything not listed stays local. Every case sent is logged to a `.sent.jsonl` file. Secret
+  redaction covers common key formats only; treat it as a safety net.
+- Each case records `written_by`: the AI coding agent named in commit trailers or PR text, or
+  `unmarked` when there is no marker (which does not prove a human wrote it).
 - Labels are `label_source: "inferred"`: the teacher's judgement, not human-validated.
 
 ## 2. Train Laya on the DGX Spark
@@ -85,8 +90,25 @@ The report (`out/report.md`, `out/report.json`) gives, per question and backend:
 and calibration error, change-level accuracy, under- and over-calls, and how many changes that
 needed escalation were missed. A change-level answer is the highest answer among its units.
 
-Backends are compared only on changes that are complete and that every backend answered.
-Changes with an incomplete diff are counted separately and never scored as classified.
+Backends are compared only on changes that are complete, that every backend answered, and whose
+inputs no backend truncated. Changes with an incomplete diff or a truncated input are counted
+separately as requiring escalation and are never scored as classified. When the test set mixes
+AI-written and unmarked changes, the report also breaks the results down by author.
+
+### Checking the teacher
+
+An LLM judge can favour output from its own model family, and the first teacher is Claude. To
+check, label the AI-written changes and a control group again with an OpenAI model and compare:
+
+```bash
+pip install openai
+export OPENAI_API_KEY=...
+python label_second_teacher.py --allow-external openai --model <openai-model-id>
+python evaluate.py teachers claude=data/labels.jsonl openai=data/labels.openai.jsonl
+```
+
+If Claude answers lower than the second teacher more often on Claude-written changes than on
+unmarked ones, its labels for AI-written code are suspect.
 
 ## Tests
 

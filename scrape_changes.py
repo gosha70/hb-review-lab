@@ -26,9 +26,10 @@ import urllib.error
 from collections import defaultdict
 
 import repo_audit as gh
-from common import append_jsonl, read_jsonl, redact
+from common import append_jsonl, read_jsonl, redact, written_by
 
 MAX_FILE_PAGES = 3  # 300 files
+SINGLE_CALL_FILE_CAP = 300  # compare and commit endpoints return at most this many files
 
 
 def get(token: str, path: str):
@@ -63,6 +64,8 @@ def scrape_pr(token: str, c: dict) -> dict:
     pr = get(token, f"/repos/{repo}/pulls/{n}")
     reviews = paged(token, f"/repos/{repo}/pulls/{n}/reviews")
     comments = paged(token, f"/repos/{repo}/pulls/{n}/comments")
+    commits = paged(token, f"/repos/{repo}/pulls/{n}/commits", 3)
+    author = written_by(c["author"], pr.get("body"), *[k["commit"]["message"] for k in commits])
 
     def human(u):
         return u and u.get("type") != "Bot" and u.get("login") != c["author"]
@@ -77,10 +80,14 @@ def scrape_pr(token: str, c: dict) -> dict:
         try:
             cmp_ = get(token, f"/repos/{repo}/compare/{c['base_sha']}...{first['commit_id']}")
             files, source = files_of(cmp_.get("files", [])), "at_first_review"
+            # Completeness is judged against this historical revision, not the final PR. The
+            # endpoint gives no file total, so a full page means there may be more.
+            files_complete = len(files) < SINGLE_CALL_FILE_CAP
         except (gh.RepoUnavailable, urllib.error.HTTPError):
             source = "final_first_review_commit_unavailable"
     if files is None:
         files = files_of(paged(token, f"/repos/{repo}/pulls/{n}/files", MAX_FILE_PAGES))
+        files_complete = len(files) >= (pr.get("changed_files") or 0)   # same (final) revision
 
     # GitHub keeps only the current description. If it was edited after the first review it may
     # describe the fixes, so it is left out of the prediction view.
@@ -91,6 +98,7 @@ def scrape_pr(token: str, c: dict) -> dict:
 
     return {
         "body": redact(body), "body_source": body_source, "files": files, "diff_source": source,
+        "files_complete": files_complete, "written_by": author,
         "outcome": {
             "observed": c["observed"],
             "reviews": [{"state": r["state"], "author": (r.get("user") or {}).get("login"),
@@ -111,6 +119,8 @@ def scrape_commit(token: str, c: dict) -> dict:
     return {
         "body": redact(body), "body_source": "current",
         "files": files_of(d.get("files", [])), "diff_source": "final",
+        "files_complete": len(d.get("files", [])) < SINGLE_CALL_FILE_CAP,
+        "written_by": written_by(c["author"], message),
         "outcome": {"observed": c["observed"], "reviews": [], "review_comments": []},
     }
 
@@ -118,7 +128,8 @@ def scrape_commit(token: str, c: dict) -> dict:
 def select(cands: list[dict], max_per_repo: int, include_unmerged: bool) -> list[dict]:
     by_repo = defaultdict(list)
     for c in cands:
-        if c["author_is_bot"] or c["observed"]["is_revert"]:
+        # Bots such as dependency updaters are dropped; AI coding agents are kept.
+        if c["observed"]["is_revert"] or (c["author_is_bot"] and written_by(c["author"]) == "unmarked"):
             continue
         if c["kind"] == "pr" and c["state"] != "MERGED" and not include_unmerged:
             continue
@@ -160,7 +171,7 @@ def main(argv=None) -> int:
         append_jsonl(args.out, {
             "case_id": case_id(c), "repo": c["repo"], "kind": c["kind"], "id": c["id"],
             "date": c["date"], "title": redact(c["title"]), "author": c["author"],
-            "strata": c["strata"], "files_total": c.get("changed_files"), **detail,
+            "strata": c["strata"], **detail,
         })
         written += 1
         if i % 50 == 0:

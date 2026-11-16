@@ -185,3 +185,6 @@ audit_out/
 # pipeline data and model outputs (contain private repository content)
 data/
 out/
+
+# which repositories may be sent to which external provider (names private repositories)
+external_allowlist.json

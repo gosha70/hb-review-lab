@@ -23,7 +23,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from common import build_units, load_questions, read_jsonl, write_jsonl
+from common import build_units, load_questions, read_jsonl, unread_files, write_jsonl
 
 
 def split(cases: list[dict], val_frac: float, test_frac: float, holdout: set[str]):
@@ -50,7 +50,7 @@ def unit_rows(case: dict, label: dict, questions: dict) -> list[dict]:
     return [{
         "id": f"{case['case_id']}::{u['unit']}", "case_id": case["case_id"],
         "state": u["state"], "questions": questions, "expected": label["units"][u["unit"]],
-        "tags": [case["repo"], case["kind"]],
+        "tags": [case["repo"], case["kind"], f"by:{case.get('written_by', 'unmarked')}"],
     } for u in units if u["unit"] in label["units"]]
 
 
@@ -87,6 +87,7 @@ def main(argv=None) -> int:
         "expected": labels[c["case_id"]]["change"], "units": by_case[c["case_id"]],
         "units_complete": labels[c["case_id"]]["units_complete"],
         "incomplete_reasons": labels[c["case_id"]].get("incomplete_reasons", []),
+        "unread_files": unread_files(c), "written_by": c.get("written_by", "unmarked"),
     } for c in test])
 
     print(f"train: {len(train)} changes, {len(train_rows)} units")

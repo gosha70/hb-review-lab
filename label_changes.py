@@ -13,7 +13,8 @@ Usage:
 
 Re-running resumes: finished cases are skipped and a submitted batch is picked up again.
 The diffs and review comments are sent to the Anthropic API, so the run must be confirmed with
---allow-external anthropic. scrape_changes.py redacts common secret formats first; that is a
+--allow-external anthropic, and only repositories listed under "anthropic" in
+external_allowlist.json are sent. scrape_changes.py redacts common secret formats first; that is a
 safety net, not a guarantee. Every case sent is logged to <out>.sent.jsonl.
 """
 from __future__ import annotations
@@ -25,7 +26,8 @@ import sys
 import time
 from pathlib import Path
 
-from common import MAX_UNITS, UNIT_CHARS, append_jsonl, build_units, load_questions, options, read_jsonl
+from common import (MAX_UNITS, UNIT_CHARS, allowed_repos, append_jsonl, build_units, load_questions,
+                    options, read_jsonl)
 
 MODEL = "claude-opus-5-5"
 BATCH_SIZE = 1000
@@ -152,13 +154,14 @@ def main(argv=None) -> int:
     ap.add_argument("--max-units", type=int, default=MAX_UNITS)
     ap.add_argument("--allow-external", choices=["anthropic"],
                     help="required: confirms these diffs and review comments may be sent to Anthropic")
-    ap.add_argument("--exclude-repo", action="append", default=[],
-                    help="owner/name whose code must never be sent (repeatable)")
+    ap.add_argument("--allowlist", default="external_allowlist.json",
+                    help="JSON file naming the repositories whose code may be sent to each provider")
     args = ap.parse_args(argv)
     if args.allow_external != "anthropic":
         sys.exit("This step sends source diffs and review comments to the Anthropic API.\n"
-                 "Re-run with --allow-external anthropic to confirm, and use --exclude-repo for "
-                 "repositories that must stay local.")
+                 "Re-run with --allow-external anthropic to confirm. Only repositories listed under "
+                 "'anthropic' in the allowlist file are sent.")
+    allowed = allowed_repos("anthropic", args.allowlist)
 
     import anthropic
     from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
@@ -214,7 +217,10 @@ def main(argv=None) -> int:
         pending_path.unlink()
 
     done = {r["case_id"] for r in read_jsonl(args.out)}
-    todo = [c for k, c in cases.items() if k not in done and c["repo"] not in set(args.exclude_repo)]
+    blocked = sorted({c["repo"] for c in cases.values()} - allowed)
+    if blocked:
+        log(f"Not on the anthropic allowlist, will not be sent: {', '.join(blocked)}")
+    todo = [c for k, c in cases.items() if k not in done and c["repo"] in allowed]
     if args.limit:
         todo = todo[:args.limit]
     log(f"{len(done)} cases already labelled, {len(todo)} to label with {args.model}")

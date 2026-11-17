@@ -1,4 +1,4 @@
 {
-  "anthropic": ["your-login/your-repo", "django/django"],
-  "typesafe": ["django/django"]
+  "anthropic": ["your-login/your-repo", "your-login/another-repo"],
+  "typesafe": []
 }

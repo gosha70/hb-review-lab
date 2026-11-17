@@ -26,7 +26,7 @@ import urllib.error
 from collections import defaultdict
 
 import repo_audit as gh
-from common import attribute, append_jsonl, read_jsonl, redact, written_by
+from common import attribute, append_jsonl, read_jsonl, redact, strip_review_loop, written_by
 
 MAX_FILE_PAGES = 3  # 300 files
 PR_COMMIT_CAP = 250   # GitHub lists at most this many commits for a pull request
@@ -106,11 +106,23 @@ def scrape_pr(token: str, c: dict) -> dict:
         revision = revision[:shas.index(first["commit_id"]) + 1] if first["commit_id"] in shas else None
     author, evidence = attribute(revision, ("author_login", c["author"]), ("pr_description", body))
 
+    all_shas = [k["sha"] for k in commits]
+    after = None
+    if first and len(commits) < PR_COMMIT_CAP and first["commit_id"] in all_shas:
+        after = len(all_shas) - all_shas.index(first["commit_id"]) - 1
+
+    # Lines that report how review went are hindsight even in a description nobody edited.
+    body, loop_notes = strip_review_loop(body)
+    if loop_notes:
+        body_source = "stripped_review_loop"
+
     return {
         "body": redact(body), "body_source": body_source, "files": files, "diff_source": source,
         "files_complete": files_complete, "written_by": author, "written_by_evidence": evidence,
         "outcome": {
             "observed": c["observed"],
+            "commits_after_first_review": after,   # None when unknown (no review, or history rewritten)
+            "review_loop_notes": [redact(l) for l in loop_notes],
             "reviews": [{"state": r["state"], "author": (r.get("user") or {}).get("login"),
                          "human": bool(human(r.get("user"))), "body": redact(r.get("body"))}
                         for r in reviews if r.get("body") or r["state"] != "COMMENTED"],
@@ -127,12 +139,14 @@ def scrape_commit(token: str, c: dict) -> dict:
     message = d["commit"]["message"]
     body = message.split("\n", 1)[1].strip() if "\n" in message else ""
     author, evidence = attribute([(c["id"], message)], ("author_login", c["author"]))
+    body, loop_notes = strip_review_loop(body)
     return {
-        "body": redact(body), "body_source": "current",
+        "body": redact(body), "body_source": "stripped_review_loop" if loop_notes else "current",
         "files": files_of(d.get("files", [])), "diff_source": "final",
         "files_complete": len(d.get("files", [])) < SINGLE_CALL_FILE_CAP,
         "written_by": author, "written_by_evidence": evidence,
-        "outcome": {"observed": c["observed"], "reviews": [], "review_comments": []},
+        "outcome": {"observed": c["observed"], "review_loop_notes": [redact(l) for l in loop_notes],
+                    "reviews": [], "review_comments": []},
     }
 
 
@@ -168,7 +182,7 @@ def main(argv=None) -> int:
     todo = [c for c in select(read_jsonl(args.candidates), args.max_per_repo, args.include_unmerged)
             if case_id(c) not in done]
     gh.log(f"{len(done)} cases already scraped, {len(todo)} to fetch")
-    written = skipped = unreadable = 0
+    written = skipped = unreadable = stripped = 0
     for i, c in enumerate(todo, 1):
         try:
             detail = scrape_pr(token, c) if c["kind"] == "pr" else scrape_commit(token, c)
@@ -185,9 +199,11 @@ def main(argv=None) -> int:
             "strata": c["strata"], **detail,
         })
         written += 1
+        stripped += detail["body_source"] == "stripped_review_loop"
         if i % 50 == 0:
             gh.log(f"  {i}/{len(todo)}")
-    gh.log(f"Wrote {written} cases to {args.out} ({unreadable} with no readable diff); skipped {skipped}")
+    gh.log(f"Wrote {written} cases to {args.out} ({unreadable} with no readable diff, "
+           f"{stripped} with review-loop lines removed from the description); skipped {skipped}")
     return 0
 
 

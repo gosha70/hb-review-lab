@@ -11,7 +11,9 @@ Usage:
     python repo_audit.py --owner LOGIN --out audit_out
     python repo_audit.py --repos-file repos.txt --out audit_out   # owner/name per line
 
-Re-running with the same --out resumes where it stopped.
+Re-running with the same --out resumes where it stopped, and runs for different repositories
+add to the same outputs. A repository already collected is not fetched again, so to change its
+--max-prs or --max-commits use a new --out.
 
 Outputs (in --out):
     repos.csv         one row per repository
@@ -36,29 +38,10 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from common import SENSITIVE
+
 API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 
-# Heuristic strata for sampling. These are NOT risk labels.
-SENSITIVE = {
-    "security": re.compile(
-        r"auth|login|session|token|secret|crypt|passw|permission|acl|oauth|jwt|saml|sso|"
-        r"cors|csrf|sanitiz|security|credential|\.env",
-        re.I,
-    ),
-    "data_migration": re.compile(r"migrations?/|\.sql$|schema|alembic|flyway|liquibase", re.I),
-    "infra_ci": re.compile(
-        r"dockerfile|docker-compose|\.github/workflows|terraform|\.tf$|k8s|kubernetes|helm|"
-        r"deploy|nginx|\.gitlab-ci",
-        re.I,
-    ),
-    "dependencies": re.compile(
-        r"(^|/)(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|requirements[^/]*\.txt|"
-        r"pyproject\.toml|poetry\.lock|uv\.lock|go\.(mod|sum)|cargo\.(toml|lock)|pom\.xml|"
-        r"build\.gradle(\.kts)?|gemfile(\.lock)?)$",
-        re.I,
-    ),
-    "ui": re.compile(r"\.(tsx|jsx|vue|svelte|css|scss|html)$", re.I),
-}
 REVERT_RE = re.compile(r"^revert\b", re.I)
 REVERTS_SHA_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
 FIX_RE = re.compile(r"\b(fix(es|ed)?|bug|hotfix|regression|patch(es|ed)?)\b", re.I)
@@ -90,6 +73,7 @@ query($owner:String!,$name:String!,$cursor:String){
         reviews(first:50){nodes{state author{login __typename} comments{totalCount}}}
         files(first:100){nodes{path}}
         commits(last:1){nodes{commit{statusCheckRollup{state}}}}
+        history: commits(first:100){nodes{commit{statusCheckRollup{state}}}}
       }
     }
   }
@@ -324,6 +308,11 @@ def analyse(store: Store, repo: str) -> tuple[dict, list[dict]]:
         tip = p["commits"]["nodes"]
         ci = ((tip[0]["commit"]["statusCheckRollup"] or {}).get("state")) if tip else None
         paths = [f["path"] for f in (p["files"] or {"nodes": []})["nodes"]]
+        # CI that failed on an earlier commit and passes on the last one: a problem found and
+        # fixed before merge. None when the commit history was not collected.
+        hist = p.get("history")
+        red_then_green = None if hist is None else ci == "SUCCESS" and any(
+            ((n["commit"]["statusCheckRollup"] or {}).get("state")) in CI_FAILED for n in hist["nodes"])
         merge_oid = (p["mergeCommit"] or {}).get("oid")
         cands.append({
             "repo": repo, "kind": "pr", "id": p["number"], "title": p["title"],
@@ -341,6 +330,7 @@ def analyse(store: Store, repo: str) -> tuple[dict, list[dict]]:
                 "bot_reviews": len(bots),
                 "discussion_comments": p["comments"]["totalCount"],
                 "ci_failed": ci in CI_FAILED,
+                "ci_red_then_green": red_then_green,
                 "reverted": was_reverted(merge_oid),
                 "is_revert": bool(REVERT_RE.search(p["title"])),
                 "is_fix": bool(FIX_RE.search(p["title"])),
@@ -365,6 +355,7 @@ def analyse(store: Store, repo: str) -> tuple[dict, list[dict]]:
                 "human_reviews": 0, "human_inline_comments": 0, "changes_requested": False,
                 "bot_reviews": 0, "discussion_comments": 0,
                 "ci_failed": ci in CI_FAILED,
+                "ci_red_then_green": False,
                 "reverted": was_reverted(c["oid"]),
                 "is_revert": bool(REVERT_RE.search(c["messageHeadline"])),
                 "is_fix": bool(FIX_RE.search(c["messageHeadline"])),
@@ -374,7 +365,8 @@ def analyse(store: Store, repo: str) -> tuple[dict, list[dict]]:
         o = c["observed"]
         # Evidence that something was wrong with, or questioned about, THIS change.
         c["has_outcome_evidence"] = bool(
-            o["human_inline_comments"] or o["changes_requested"] or o["ci_failed"] or o["reverted"])
+            o["human_inline_comments"] or o["changes_requested"] or o["ci_failed"] or o["reverted"]
+            or o["ci_red_then_green"])
 
     pr_c = [c for c in cands if c["kind"] == "pr"]
     cm_c = [c for c in cands if c["kind"] == "commit"]
@@ -400,6 +392,8 @@ def analyse(store: Store, repo: str) -> tuple[dict, list[dict]]:
             c["observed"]["bot_reviews"] > 0 and c["observed"]["human_reviews"] == 0 for c in pr_c),
         "changes_with_ci": sum(c["ci_state"] is not None for c in cands),
         "changes_ci_failed": sum(c["observed"]["ci_failed"] for c in cands),
+        "prs_ci_red_then_green": sum(bool(c["observed"]["ci_red_then_green"]) for c in pr_c),
+        "prs_without_ci_history": sum("history" not in p for p in prs),
         "reverts": sum(c["observed"]["is_revert"] for c in cands),
         "changes_reverted": sum(c["observed"]["reverted"] for c in cands),
         "fix_changes": sum(c["observed"]["is_fix"] for c in cands),
@@ -432,7 +426,8 @@ def write_summary(out: Path, rows: list[dict], skipped: list[str]) -> None:
         f"| PRs with changes requested | {tot('prs_changes_requested')} |",
         f"| PRs reviewed only by bots | {tot('prs_bot_review_only')} |",
         f"| Changes with any CI result | {tot('changes_with_ci')} |",
-        f"| Changes with failed CI | {tot('changes_ci_failed')} |",
+        f"| Changes with failed CI on the final commit | {tot('changes_ci_failed')} |",
+        f"| PRs where CI failed, then passed before merge | {tot('prs_ci_red_then_green')} |",
         f"| Changes later reverted (explicit revert commit) | {tot('changes_reverted')} |",
         f"| Fix-like changes (title keyword) | {tot('fix_changes')} |",
         f"| Candidates with observed outcome evidence | {ev} |",
@@ -447,8 +442,9 @@ def write_summary(out: Path, rows: list[dict], skipped: list[str]) -> None:
         "## Reading",
         "",
         f"- Observed-evidence share: {ev}/{n}" + (f" ({ev / n:.1%})." if n else "."),
-        "- 'Observed outcome evidence' means human inline comments, requested changes, failed CI,",
-        "  or an explicit revert. Absence of evidence is not evidence the change was safe.",
+        "- 'Observed outcome evidence' means human inline comments, requested changes, CI that failed",
+        "  (on the final commit, or earlier and then fixed), or an explicit revert. Absence of evidence",
+        "  is not evidence the change was safe.",
         "- Fix-like changes are counted but not linked to the change that introduced the bug.",
         "- Strata are filename patterns. A change may be security-relevant without matching any.",
         "- File paths are capped at 100 per PR and are fetched for a limited number of direct",
@@ -457,6 +453,13 @@ def write_summary(out: Path, rows: list[dict], skipped: list[str]) -> None:
     if skipped:
         lines += ["", "## Skipped", "", *[f"- {s}" for s in skipped]]
     (out / "summary.md").write_text("\n".join(lines) + "\n")
+
+
+def warn_stale(row: dict) -> None:
+    if row["prs_without_ci_history"]:
+        log(f"  WARNING: {row['prs_without_ci_history']} pull requests of {row['repo']} were collected by an "
+            "older version without per-commit CI history, so 'CI failed, then passed' is unknown for them. "
+            "Audit this repository again into a new --out.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -472,7 +475,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="per repository, stop after about N newest PRs (0 = all). "
                          "Use for large public repositories.")
     ap.add_argument("--max-commits", type=int, default=0,
-                    help="per repository, stop after about N newest commits (0 = all)")
+                    help="per repository, stop after about N newest commits. 0 = the whole history, "
+                         "including everything from before the repository used pull requests; "
+                         "set a limit for large public repositories.")
     args = ap.parse_args(argv)
 
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -507,7 +512,25 @@ def main(argv: list[str] | None = None) -> int:
             continue
         row, cands = analyse(store, repo)
         rows.append(row)
+        warn_stale(row)
         all_cands += cands
+
+    # Repositories audited into this --out by earlier runs stay in the outputs. Without this a
+    # second run (for example one adding public repositories) would replace the candidate list.
+    earlier = [r for r, st in store.state.items() if r not in repos
+               and st.get("prs", {}).get("done") and st.get("commits", {}).get("done")]
+    for repo in sorted(earlier):
+        row, cands = analyse(store, repo)
+        rows.append(row)
+        warn_stale(row)
+        all_cands += cands
+    if earlier:
+        log(f"Kept {len(earlier)} repositories from earlier runs: {', '.join(sorted(earlier))}")
+    unfinished = sorted(r for r in store.state if r not in repos and r not in earlier)
+    if unfinished:
+        log(f"Left out, because an earlier run did not finish them: {', '.join(unfinished)}. "
+            "Name them again to resume.")
+    rows.sort(key=lambda r: r["repo"])
 
     if rows:
         with (out / "repos.csv").open("w", newline="") as f:

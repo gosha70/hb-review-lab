@@ -7,6 +7,7 @@ companion: 2026-11-16-code-review-addendum.md (owner decisions and data the pipe
 verdict: changes requested before the pilot
 rereviewed: 99cdcd9 (2026-11-16): blockers fixed; W1 partly fixed; W2–W4 open
 rereviewed_2: b847917 (2026-11-16): W1–W4 fixed; new W2b and W3b open; owner keeps criticality
+rereviewed_3: 2d6a86a / PR #9 (2026-11-16): W2b and W3b fixed; W2c (three missed leak phrasings) open
 ---
 
 # Code review: pipeline and pilot runbook at `c3b35ac`
@@ -30,7 +31,69 @@ Severities follow the review-loop scale (blocking / warning / note). File:line r
 - Read-only GitHub checks of the owner's repositories and of django/django and grafana/grafana
   produced the numbers below.
 
-## Re-review of `b847917` (latest)
+## Re-review of `2d6a86a`, PR #9 (latest)
+
+What I checked:
+
+- Read the diff from `b847917`.
+- 18 of 18 tests pass. The test functions are the same 18 as at `b847917`, so none was lost.
+- Re-ran `strip_review_loop()` over the same 238 real merged PR descriptions, plus probes.
+- PR #9 is open with head `2d6a86a`; GitHub reports it mergeable, and CI (`unit`) is green.
+
+**Verdict.** W2b and W3b are fixed. One small leak-recall gap (W2c) remains. Add it to PR #9 before
+merging: the stripper changes what the teacher and the classifier see, and the PR's own rule is that
+such changes land before the first labelling run.
+
+| Item | Status | Evidence |
+|---|---|---|
+| W2b over-stripping | Fixed | All 7 must-keep probes survive, including "bcrypt at 12 rounds", "PBKDF2, 600000 rounds" and the #418 line. Real removals fell from 120 lines in 75 descriptions to 60 lines in 33, and what's removed is now almost all review outcomes ("DeepSeek: PASS, 0 blocking…", "## Review rounds" sections). A few lines that mix a change description with a review result go whole, e.g. ai-atlas #20 and #45. That's acceptable at line granularity. |
+| W3b red-to-green CI | Fixed | `repo_audit.py` reads CI state across up to 100 commits per PR (alias `history`) and records `ci_red_then_green`. `conflicts()` uses it instead of a red final commit, which is still recorded and still shown to the teacher. |
+| Pilot effort comparison | Fixed | The seeded `--limit` sample makes the medium run label the same 20 cases, provided `cases.jsonl` hasn't changed in between. |
+| Tests lost while editing | None | The same 18 test functions as `b847917`. |
+
+### W2c. Three real leaks now pass the narrower filter (warning, small)
+
+- **Evidence.** After stripping, 5 of 238 descriptions still carry review-loop terms in the first
+  300 characters, the part that reaches every unit header; the previous filter left 1. Two of the
+  five are correct keeps (code-copilot-team #425 and #398 describe the change). Three are real leaks,
+  all phrased with the verdict *before* the reviewer:
+  - wiki-studio #89: "each reviewed to PASS by the gating reviewer (DeepSeek)"
+  - wiki-studio #74: "were reviewed to PASS by the gating reviewer (DeepSeek)"
+  - code-copilot-team #392: "every phase reviewed to PASS by DeepSeek before the driver committed it"
+- **Probes it also misses:**
+  - "Review: PASS after 2 rounds."
+  - "Codex reviewed it and flagged two issues, both fixed."
+  - "Reviewer pass at 3599cca (comment above): five findings, all taken". Inside #443's "## Review
+    rounds" section this one is removed; on its own it isn't.
+- **New false positives:**
+  - "Codex: failed requests now retry with backoff." (`codex` + `:` + `fail`)
+  - "Measure DeepSeek round-trip latency per request." (`deepseek` + `round`)
+- **Fix:**
+  - Match a verdict that comes before the reviewer: `reviewed to (PASS|FAIL)`, and a verdict followed
+    within ~40 characters by `by (the gating reviewer|DeepSeek|Codex)`.
+  - Match a line-start `Review: PASS|FAIL`, `<named> reviewed … (flagged|found|raised)`, and
+    `reviewer pass … findings`.
+  - Make the verdict tokens case-sensitive uppercase (`PASS`, `FAIL`, `INCONCLUSIVE`). Every example
+    in the owner's descriptions is in capitals, and it removes the "Codex: failed" false positive.
+  - Exclude `round-trip`.
+  - Add all of the above as tests.
+- **Safety net: warn broadly, strip narrowly.** `build_dataset.py`'s leak warning uses the same
+  patterns as the stripper, so it can't see what the stripper misses. Add a second, broad count (any
+  header line mentioning DeepSeek, Codex, a verdict or a review round) and print a few examples for a
+  person to read in the pilot.
+
+### Notes
+
+- **A stale `audit_out/` produces no warning.** Raw pages collected before this commit have no
+  `history`, so `ci_red_then_green` comes out `None` for every PR, and the disagreement rule never
+  fires on CI. The builder flags that the audit must be regenerated; make the code say so too: log a
+  warning when PR rows lack `history`.
+- **Issue #8 still lists red-to-green CI as a follow-up.** It's done in PR #9; close or edit that
+  item.
+- **Watching CI.** CI on PR #9 is green at `2d6a86a`. If W2c lands as another commit, having the
+  builder watch the PR for its CI run is reasonable.
+
+## Re-review of `b847917`
 
 What I checked:
 

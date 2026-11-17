@@ -8,6 +8,7 @@ verdict: changes requested before the pilot
 rereviewed: 99cdcd9 (2026-11-16): blockers fixed; W1 partly fixed; W2–W4 open
 rereviewed_2: b847917 (2026-11-16): W1–W4 fixed; new W2b and W3b open; owner keeps criticality
 rereviewed_3: 2d6a86a / PR #9 (2026-11-16): W2b and W3b fixed; W2c (three missed leak phrasings) open
+rereviewed_4: b9e1089 / PR #9 (2026-11-16): W2c fixed; approved for merge
 ---
 
 # Code review: pipeline and pilot runbook at `c3b35ac`
@@ -31,7 +32,40 @@ Severities follow the review-loop scale (blocking / warning / note). File:line r
 - Read-only GitHub checks of the owner's repositories and of django/django and grafana/grafana
   produced the numbers below.
 
-## Re-review of `2d6a86a`, PR #9 (latest)
+## Re-review of `b9e1089`, PR #9 (latest): approved
+
+What I checked:
+
+- Read the diff from `2d6a86a`.
+- 19 of 19 tests pass. The 18 earlier test functions are all still there, plus
+  `test_old_raw_pages_without_ci_history_are_flagged`.
+- Re-ran `strip_review_loop()` over the same 238 real merged PR descriptions, plus every probe.
+- Read the edited issue #8.
+- PR #9: head `b9e1089`, CI (`unit`) green, mergeable, no conflicts.
+
+**Verdict: approved for merge.** Every finding in this review is fixed or deferred to an issue:
+
+- **Fixed:** B1–B3, W1–W5, W2b, W2c, W3b, and notes N1, N2, N5, N6 and N7.
+- **Deferred:** N3 and N4 to #8; the larger additions to #5–#7.
+
+| Check | Result |
+|---|---|
+| Real leaks in the first 300 characters | 0. The previous run had 3, and before stripping there were 8. The 2 remaining matches of the broad pattern are correct keeps: code-copilot-team #425 and #398 describe the change. |
+| Must-keep probes (9) | All kept, including "bcrypt at 12 rounds", "Codex: failed requests…" and "DeepSeek round-trip latency". |
+| Must-strip probes (4) | All stripped, including "Review: PASS after 2 rounds" and "Codex reviewed it and flagged two issues". |
+| Change from `2d6a86a` | 10 more lines removed, none restored. Nine are "…reviewed to PASS by the gating reviewer…" outcomes. One is a false positive: code-copilot-team #417, "The PR body counts the phases reviewed to PASS…", describes the change. That's acceptable in a review-tooling repository, and the broad `CHECK` output will show cases like it. |
+| Broad leak check | `build_dataset.py` prints a count and up to five examples from `review_hint()`, a deliberately wider pattern. |
+| Stale audit warning | `repo_audit.py` warns, per repository, about PRs collected without per-commit CI history. |
+| Issue #8 | Accurate: red-to-green CI and `criticality` are under "Done or settled"; the open items are unchanged. |
+
+Still not exercised: real GitHub data, the Anthropic Batch API, the Spark, the local Qwen server and
+Jev. That's the pilot's job, run from `main` after the merge. In the pilot:
+
+- Read the `build_dataset.py` `CHECK` examples.
+- Read a few labels against their diffs.
+- Compare the `high` and `medium` effort runs.
+
+## Re-review of `2d6a86a`, PR #9
 
 What I checked:
 

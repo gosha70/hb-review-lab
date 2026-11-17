@@ -26,7 +26,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from common import (MAX_UNITS, UNIT_CHARS, build_units, load_questions, options, questions_sha, read_jsonl, state_sha, strip_review_loop,
+from common import (MAX_UNITS, UNIT_CHARS, build_units, load_questions, options, questions_sha, read_jsonl, review_hint, state_sha, strip_review_loop,
                     unread_files,
                     write_jsonl)
 
@@ -163,7 +163,20 @@ def main(argv=None) -> int:
     leaked = sum(bool(strip_review_loop(r["state"].split("\nFiles:\n")[0])[1])
                  for r in train_rows + val_rows + test_rows)
     if leaked:
-        print(f"WARNING: {leaked} unit headers still mention review rounds or reviewer results.")
+        print(f"WARNING: {leaked} unit headers still contain a review-outcome line the scraper should "
+              "have removed. Scrape again with the current code.")
+    # The check above uses the stripper's own patterns, so it cannot see what the stripper misses.
+    # This one is broad: read the examples and decide whether any reports how review went.
+    hinted = {}
+    for r in train_rows + val_rows + test_rows:
+        head = r["state"].split("\nFiles:\n")[0]
+        if r["case_id"] not in hinted and review_hint(head):
+            hinted[r["case_id"]] = next((l for l in head.splitlines() if review_hint(l)), head)[:200]
+    if hinted:
+        print(f"CHECK: {len(hinted)} changes have a header that mentions a reviewer tool, a verdict or a "
+              "review round. Most describe the change; read a few to be sure none reports a review result:")
+        for cid, line in list(hinted.items())[:5]:
+            print(f"    {cid}: {line}")
     print("Effective training size is changes, not units: units of one change share a header.")
     for qid, q in questions.items():
         per = Counter(ch[qid] for ch in train_changes)

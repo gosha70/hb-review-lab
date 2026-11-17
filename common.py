@@ -352,7 +352,9 @@ def state_sha(state: str) -> str:
 
 _COUNT = r"(?:first|second|third|fourth|fifth|one|two|three|four|five|six|\d+)"
 _NAMED = r"(?:deepseek|codex)"
-_VERDICT = r"(?:pass(?:ed)?|fail(?:ed)?|inconclusive)"
+# Verdicts are matched in capitals only, as review tools print them. Lower case is ordinary
+# prose: "Codex: failed requests now retry with backoff" describes a change.
+_VERDICT = r"(?-i:PASS|FAIL|INCONCLUSIVE)"
 _REVIEW_OUTCOME = re.compile("|".join([
     # counted review rounds: "second and third review rounds", "four review rounds", "3 rounds of review"
     rf"\b{_COUNT}(?:\s+and\s+{_COUNT})?\s+(?:peer[- ])?review\s+rounds?\b",
@@ -360,16 +362,37 @@ _REVIEW_OUTCOME = re.compile("|".join([
     r"\breview\s+round\s+\d",
     # a named reviewer with a verdict: "DeepSeek: PASS", "DeepSeek on the build: PASS"
     rf"\b{_NAMED}\b[^.\n]{{0,60}}?:\s*{_VERDICT}\b",
-    # a named reviewer with its rounds: "DeepSeek, two rounds on the spec"
-    rf"\b{_NAMED}\b[^.\n]{{0,30}}?\brounds?\b",
+    # the verdict before the reviewer: "reviewed to PASS", "PASS by the gating reviewer (DeepSeek)"
+    rf"\breviewed\s+to\s+{_VERDICT}\b",
+    rf"\b{_VERDICT}\b[^.\n]{{0,40}}?\bby\s+(?:the\s+gating\s+reviewer|{_NAMED})\b",
+    # a review line with a verdict: "Review: PASS after 2 rounds."
+    rf"^\s*(?:[-*]\s*)?(?:peer[- ])?review\s*:\s*{_VERDICT}\b",
+    # a named reviewer with its rounds: "DeepSeek, two rounds on the spec" (not "round-trip")
+    rf"\b{_NAMED}\b[^.\n]{{0,30}}?\brounds?\b(?!-trip)",
+    # a named reviewer and what it turned up: "Codex reviewed it and flagged two issues"
+    rf"\b{_NAMED}\s+reviewed\b[^.\n]{{0,40}}?\b(?:flagged|found|raised)\b",
     # a review with a tally: "Codex review: 2 findings", "peer review: no findings"
     rf"\b(?:{_NAMED}|peer)[- ]review\b[^.\n]{{0,20}}?:\s*(?:\d+|no)\s+(?:findings?|warnings?|notes?|blocking)",
+    # "Reviewer pass at 3599cca: five findings, all taken"
+    r"\breviewer\s+pass\b[^.\n]{0,80}?\bfindings?\b",
     # an ordinal review with what it did: "the second review found"
     r"\b(?:first|second|third|fourth|re)[- ]review\s+(?:found|passed|failed|flagged|raised)\b",
     # a bare verdict: "verdict: PASS", "PASS, notes only"
     rf"\bverdict\s*:\s*{_VERDICT}\b",
-    r"\b(?:PASS|FAIL), notes only\b",
-]), re.I)
+    rf"\b{_VERDICT}, notes only\b",
+]), re.I | re.M)
+# Broader than the stripper on purpose: anything that might be a review outcome. Used only to
+# warn, so a person reads the examples; it would remove too much if used to strip.
+_REVIEW_HINT = re.compile(
+    rf"\bdeepseek\b|\bcodex\b|\b{_VERDICT}\b|\breview(?:ed)?[- ]rounds?\b|\brounds?\s+of\s+review\b|"
+    r"\bgating\s+reviewer\b|\breviewed\s+to\b", re.I)
+
+
+def review_hint(text: str | None) -> bool:
+    """True when text mentions a reviewer tool, a verdict or a review round at all."""
+    return bool(_REVIEW_HINT.search(text or ""))
+
+
 _REVIEW_HEADING = re.compile(r"^(#{1,6})\s*(?:peer[- ])?review[- ](?:rounds?|loop|results?|verdicts?|history)\b", re.I)
 _HEADING = re.compile(r"^(#{1,6})\s")
 

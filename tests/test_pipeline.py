@@ -466,6 +466,13 @@ class PipelineTest(unittest.TestCase):
             "The second review found a missing null check.",
             "Verdict: FAIL",
             "3 rounds of review before merge",
+            "each reviewed to PASS by the gating reviewer (DeepSeek)",                           # wiki-studio #89
+            "were reviewed to PASS by the gating reviewer (DeepSeek)",                           # wiki-studio #74
+            "every phase reviewed to PASS by DeepSeek before the driver committed it",           # code-copilot-team #392
+            "Review: PASS after 2 rounds.",
+            "Codex reviewed it and flagged two issues, both fixed.",
+            "Reviewer pass at 3599cca (comment above): five findings, all taken",
+            "Marked FAIL by Codex on the first attempt",
         ]
         must_keep = [
             "Hash passwords with bcrypt at 12 rounds.",
@@ -478,6 +485,10 @@ class PipelineTest(unittest.TestCase):
             "Add the review-loop state file and a command to resume a review round",
             "Adds a reviewer assignment endpoint",
             "Tests pass locally; fail fast when the token is missing.",
+            "Codex: failed requests now retry with backoff.",
+            "Measure DeepSeek round-trip latency per request.",
+            "Review: pass the request id through to the handler.",
+            "The reviewer pass is now skipped when no files changed.",
         ]
         for line in must_strip:
             self.assertEqual(strip(line), ("", [line]), line)
@@ -489,6 +500,13 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(clean, "Adds the session store.\n\n## Testing\nUnit tests added.")
         self.assertEqual(removed, ["## Review rounds", "- first pass: two notes", "- all applied"])
         self.assertEqual(strip(None), ("", []))
+        # the warning net is wider than the stripper: it flags these kept lines for a person to read
+        for line in ("Add Codex evaluator harness and fix parser", "Measure DeepSeek round-trip latency per request.",
+                     "Some other phrasing that ended in PASS"):
+            self.assertEqual(strip(line)[1], [])
+            self.assertTrue(common.review_hint(line), line)
+        self.assertFalse(common.review_hint("Hash passwords with bcrypt at 12 rounds."))
+        self.assertFalse(common.review_hint("Tests pass locally; fail fast when the token is missing."))
 
     def test_binary_only_change_is_kept_and_escalated(self):
         questions = common.load_questions()

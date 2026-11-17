@@ -179,6 +179,20 @@ class AuditTest(unittest.TestCase):
             rows = [r["repo"] for r in csv.DictReader(open(f"{out}/repos.csv"))]
             self.assertEqual(rows, ["me/app", "me/other"])
 
+    def test_old_raw_pages_without_ci_history_are_flagged(self):
+        with tempfile.TemporaryDirectory() as out:
+            self.run_audit(out, "me/app")
+            raw = Path(out) / "raw" / "me__app.prs.jsonl"
+            rows = [json.loads(l) for l in raw.read_text().splitlines()]
+            for r in rows:
+                r.pop("history")                      # as collected before the history was added
+            raw.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            self.run_audit(out, "me/app")             # resumes from the cache
+            row = next(csv.DictReader(open(f"{out}/repos.csv")))
+            self.assertEqual((row["prs_without_ci_history"], row["prs_ci_red_then_green"]), ("4", "0"))
+            cands = [json.loads(l) for l in open(f"{out}/candidates.jsonl")]
+            self.assertTrue(all(c["observed"]["ci_red_then_green"] is None for c in cands if c["kind"] == "pr"))
+
     def test_resume_skips_finished_pages(self):
         with tempfile.TemporaryDirectory() as out:
             self.run_audit(out, "me/app")

@@ -393,6 +393,7 @@ def analyse(store: Store, repo: str) -> tuple[dict, list[dict]]:
         "changes_with_ci": sum(c["ci_state"] is not None for c in cands),
         "changes_ci_failed": sum(c["observed"]["ci_failed"] for c in cands),
         "prs_ci_red_then_green": sum(bool(c["observed"]["ci_red_then_green"]) for c in pr_c),
+        "prs_without_ci_history": sum("history" not in p for p in prs),
         "reverts": sum(c["observed"]["is_revert"] for c in cands),
         "changes_reverted": sum(c["observed"]["reverted"] for c in cands),
         "fix_changes": sum(c["observed"]["is_fix"] for c in cands),
@@ -454,6 +455,13 @@ def write_summary(out: Path, rows: list[dict], skipped: list[str]) -> None:
     (out / "summary.md").write_text("\n".join(lines) + "\n")
 
 
+def warn_stale(row: dict) -> None:
+    if row["prs_without_ci_history"]:
+        log(f"  WARNING: {row['prs_without_ci_history']} pull requests of {row['repo']} were collected by an "
+            "older version without per-commit CI history, so 'CI failed, then passed' is unknown for them. "
+            "Audit this repository again into a new --out.")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--owner", help="audit every non-fork repository owned by this login")
@@ -504,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         row, cands = analyse(store, repo)
         rows.append(row)
+        warn_stale(row)
         all_cands += cands
 
     # Repositories audited into this --out by earlier runs stay in the outputs. Without this a
@@ -513,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     for repo in sorted(earlier):
         row, cands = analyse(store, repo)
         rows.append(row)
+        warn_stale(row)
         all_cands += cands
     if earlier:
         log(f"Kept {len(earlier)} repositories from earlier runs: {', '.join(sorted(earlier))}")

@@ -504,6 +504,10 @@ def main(argv: list[str] | None = None) -> int:
         all_cands += cands
     if earlier:
         log(f"Kept {len(earlier)} repositories from earlier runs: {', '.join(sorted(earlier))}")
+    unfinished = sorted(r for r in store.state if r not in repos and r not in earlier)
+    if unfinished:
+        log(f"Left out, because an earlier run did not finish them: {', '.join(unfinished)}. "
+            "Name them again to resume.")
     rows.sort(key=lambda r: r["repo"])
 
     if rows:

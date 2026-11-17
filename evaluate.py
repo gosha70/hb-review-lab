@@ -4,22 +4,25 @@
     # Laya (run inside the Laya container on the Spark: see spark/run.sh predict)
     python evaluate.py predict --backend laya --checkpoint /out/hb-review --out /out/pred.laya.jsonl
 
-    # Jev (hosted API; sends the test diffs to TypeSafe)
+    # Optional: Jev (hosted API; sends the test diffs to TypeSafe)
     export TYPESAFE_API_KEY=...
     python evaluate.py predict --backend jev --allow-external typesafe --out out/pred.jev.jsonl
 
     # Side-by-side report
-    python evaluate.py report laya=out/pred.laya.jsonl jev=out/pred.jev.jsonl --out out/report
+    python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl --out out/report
 
     # Teacher-disagreement screen for potential bias (see label_second_teacher.py)
-    python evaluate.py teachers claude=data/labels.jsonl openai=data/labels.openai.jsonl
+    python evaluate.py teachers claude=data/labels.jsonl qwen=data/labels.second.jsonl
 
 Every backend answers the same unit inputs with the same questions. A change-level answer is
 the highest answer among the change's units, so one risky unit escalates the whole change.
 
-Backends are compared only on changes that are complete, that every backend answered in full,
-and whose inputs no backend truncated. A change with an incomplete diff, or with a unit the
-model could not read whole, is never scored as classified: it is reported as needing escalation.
+Each backend is scored on every complete change it answered in full without truncating an
+input, and its coverage is shown. A separate head-to-head table compares the backends on the
+changes they all answered. A change with an incomplete diff, or with a unit the model could not
+read whole, is never scored as classified: it is reported as needing escalation.
+
+Jev is optional. It sends the test diffs to a fourth party and is not needed for the report.
 """
 from __future__ import annotations
 
@@ -288,35 +291,41 @@ def cmd_report(args) -> int:
         preds[name] = {r["id"]: r for r in read_jsonl(path)}
     incomplete = [c for c in changes if not c["units_complete"]]
     complete = [c for c in changes if c["units_complete"] and c["units"]]
-    truncated = [c for c in complete
-                 if any(p.get(i, {}).get("truncated") for p in preds.values() for i in c["units"])]
-    scored = [c for c in complete if c not in truncated
-              and all(i in p for p in preds.values() for i in c["units"])]
     reasons = Counter(r for c in incomplete for r in c.get("incomplete_reasons") or ["unspecified"])
-    results = {name: score(p, units, changes, scored, questions) for name, p in preds.items()}
+
+    # Each backend is scored on every complete change it answered in full without truncating an
+    # input. A backend that covers fewer repositories (Jev, behind its allowlist) therefore does
+    # not shrink the others' scores. Changes it could not answer cleanly require escalation.
+    def own(p):
+        return [c for c in complete if all(i in p and not p[i].get("truncated") for i in c["units"])]
+
+    scored = {name: own(p) for name, p in preds.items()}
+    results = {name: score(p, units, changes, scored[name], questions) for name, p in preds.items()}
     # Constant baseline from the train split, shown in the per-question tables only.
     rows = dict(results)
     maj_path = Path(args.majority) if args.majority else Path(args.data).parent / "majority.json"
     maj = json.loads(maj_path.read_text()) if maj_path.exists() else None
-    if maj and all(maj["unit"].get(q) is not None and maj["change"].get(q) is not None for q in questions):
-        rows["majority"] = majority_baseline(maj, units, scored, questions)
+    has_majority = bool(maj) and all(
+        maj["unit"].get(q) is not None and maj["change"].get(q) is not None for q in questions)
+    if has_majority:
+        rows["majority"] = majority_baseline(maj, units, complete, questions)
 
     md = ["# Classifier comparison", "",
           f"Held-out set: {len(changes)} changes, {len(units)} units.",
-          f"- {len(scored)} changes are scored: complete diff, answered in full by every backend, no truncated input.",
+          f"- {len(complete)} changes have a complete diff and can be scored.",
           f"- {len(incomplete)} changes have an incomplete diff"
           + (f" ({', '.join(f'{k}: {v}' for k, v in sorted(reasons.items()))})" if reasons else "")
           + ". Not scored; they require escalation.",
-          f"- {len(truncated)} complete changes had a unit that a backend truncated. Not scored; they require escalation.",
-          f"- {len(complete) - len(scored) - len(truncated)} complete changes were not answered by every backend.",
+          "- Each backend is scored on the complete changes it answered in full with no truncated input "
+          "(\"Changes scored\"). The rest of its changes require escalation.",
           "", "Labels are teacher-inferred, so every number is agreement with the teacher.", "",
           "Unit accuracy and ECE exclude units whose input the backend truncated.", "",
-          "| Backend | Units answered | Truncated units | Changes with a truncated unit | Changes answered | "
+          "| Backend | Units answered | Truncated units | Changes with a truncated unit | Changes scored | "
           "Latency mean (ms/unit) | Latency p95 |",
           "|---|---|---|---|---|---|---|"]
     for name, r in results.items():
         md.append(f"| {name} | {r['units_answered']}/{r['units']} | {r['units_truncated']} | {r['changes_truncated']} | "
-                  f"{r['changes_answered']}/{r['changes']} | {fmt(r['latency_ms_mean'])} | {fmt(r['latency_ms_p95'])} |")
+                  f"{r['changes_scored']}/{len(complete)} | {fmt(r['latency_ms_mean'])} | {fmt(r['latency_ms_p95'])} |")
     md += ["", "Escalation missed: the change needed more than the lowest option and the classifier chose the lowest.",
            "Top level missed: the change needed the highest option and the classifier chose lower.", "",
            "| Question | Backend | Unit accuracy | Unit ECE | Change accuracy | Under-called | Over-called | "
@@ -324,6 +333,8 @@ def cmd_report(args) -> int:
            "|---|---|---|---|---|---|---|---|---|"]
     for qid in questions:
         for name, r in rows.items():
+            if name.startswith("_"):
+                continue
             m = r["questions"][qid]
             md.append(
                 f"| {qid} | {name} | {fmt(m['unit_accuracy'], True)} | {fmt(m['unit_ece'])} | "
@@ -333,11 +344,31 @@ def cmd_report(args) -> int:
         md += ["", "`majority` always gives the train split's most common answer (unit majority for unit "
                "accuracy, change majority for the change columns). A backend that does not beat it on a "
                "question has learned nothing useful there."]
-    md += ["", "## Teacher labels on the scored changes", "", "| Question | Changes per answer |", "|---|---|"]
+    # Paired comparison: the same changes for every backend.
+    if len(preds) > 1:
+        ids = set.intersection(*[{c["case_id"] for c in v} for v in scored.values()])
+        common = [c for c in complete if c["case_id"] in ids]
+        h2h = {name: {qid: change_metrics(common, qid, q, unit_max(p, qid, q)) for qid, q in questions.items()}
+               for name, p in preds.items()}
+        if has_majority:
+            h2h["majority"] = {qid: change_metrics(common, qid, q, (lambda lv: lambda c: lv)(level(q, maj["change"][qid])))
+                               for qid, q in questions.items()}
+        rows["_head_to_head"] = {"changes": len(common), "backends": h2h}
+        md += ["", "## Head to head", "",
+               f"The {len(common)} changes that every backend answered in full, so the backends are compared "
+               "on identical changes.", "",
+               "| Question | Backend | Change accuracy | Under-called | Over-called | Escalation missed |",
+               "|---|---|---|---|---|---|"]
+        for qid in questions:
+            for name, m in h2h.items():
+                m = m[qid]
+                md.append(f"| {qid} | {name} | {fmt(m['change_accuracy'], True)} | {m['change_under_called']} | "
+                          f"{m['change_over_called']} | {m['escalation_missed']}/{m['escalation_needed']} |")
+    md += ["", "## Teacher labels on the complete changes", "", "| Question | Changes per answer |", "|---|---|"]
     for qid, q in questions.items():
-        dist = Counter(c["expected"][qid] for c in scored)
+        dist = Counter(c["expected"][qid] for c in complete)
         md.append(f"| {qid} | " + ", ".join(f"{o}: {dist[o]}" for o in options(q)) + " |")
-    groups = Counter(c.get("written_by", "unmarked") for c in scored)
+    groups = Counter(c.get("written_by", "unmarked") for c in complete)
     if len(groups) > 1:
         md += ["", "## By author", "",
                "'unmarked' means no AI-agent marker was found, not that a human wrote it. "
@@ -347,6 +378,8 @@ def cmd_report(args) -> int:
         for qid in questions:
             for a in sorted(groups):
                 for name, r in rows.items():
+                    if name.startswith("_") or a not in r["by_author"] or not r["by_author"][a][qid]["changes"]:
+                        continue
                     m = r["by_author"][a][qid]
                     md.append(f"| {qid} | {a} | {m['changes']} | {fmt(m['escalation_needed'] / m['changes'], True)} | "
                               f"{name} | {fmt(m['change_accuracy'], True)} | {m['change_under_called']} | "

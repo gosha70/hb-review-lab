@@ -47,8 +47,9 @@ How the data is shaped:
   `units_complete: false`, with the reason, when it needs more than 60 units, when a changed
   file has no readable diff (too large, or binary), or when not all files of the retrieved
   revision were fetched.
-- Every unit of a change carries the same **header** (at most 950 characters): repository,
-  title, the start of the description, a summary of the whole change, and a list of up to 8
+- Every unit of a change carries the same **header** (at most 950 characters): the title, the
+  start of the description (the repository name is left out, so the classifier cannot learn a
+  prior per repository), a summary of the whole change, and a list of up to 8
   files. The summary gives files added/deleted/renamed/modified; files and lines per kind
   (source, test, docs); test lines per source line; files per path stratum (security,
   migration, infra/CI, dependencies, UI); the top directories; and files without a readable
@@ -71,9 +72,16 @@ How the data is shaped:
   Many agent-written commits carry no marker at all, so `unmarked` is not "human": in a
   repository built with an AI agent it mostly means "agent, without a marker". The by-author
   tables compare marked with unmarked changes; they cannot be read as AI versus human.
-- Labels record a fingerprint of `questions.json`. If the questions change after labeling,
-  `build_dataset.py` refuses the old labels instead of training on answers to different
-  questions.
+- Labels record a fingerprint of `questions.json` and of every unit the teacher was shown. If
+  the questions, the header or the unit code change after labeling, `build_dataset.py` refuses
+  the affected labels instead of training on answers to different inputs. Settle
+  `questions.json` before the first labeling run.
+- Lines in a description or commit message that report how review went ("DeepSeek: PASS, notes
+  only", "second and third review rounds") are hindsight. They are removed from the prediction
+  view (`body_source: stripped_review_loop`) and kept in the outcome view, where the teacher
+  sees them. `build_dataset.py` warns if any unit header still contains one.
+- The teacher runs at `--effort high` by default; the model and effort are recorded with every
+  label. A case that fails twice is not sent again (`--max-attempts`).
 - A change with no readable diff at all (binary-only, for example) is kept as an incomplete
   case with no units, so it appears in coverage and escalation counts.
 - Labels are `label_source: "inferred"`: the teacher's judgement, not human-validated.
@@ -109,15 +117,21 @@ Settings are environment variables, for example:
 BASE=multilingual NAME=hb-review-ml TRAIN_ARGS="--epochs 8 --loss soft-ce" spark/run.sh train
 ```
 
-## 3. Evaluate and compare with Jev
+## 3. Evaluate
 
 ```bash
 spark/run.sh predict                    # tuned Laya   -> out/pred.laya.jsonl
 spark/run.sh predict english base       # untuned Laya -> out/pred.base.jsonl
 
+python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl
+```
+
+Jev is optional. It sends the test diffs to TypeSafe, so it needs a key, `--allow-external
+typesafe` and a `typesafe` entry in the allowlist:
+
+```bash
 export TYPESAFE_API_KEY=...
 python evaluate.py predict --backend jev --allow-external typesafe --out out/pred.jev.jsonl
-
 python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl jev=out/pred.jev.jsonl
 ```
 
@@ -130,28 +144,34 @@ common answer (`data/majority.json`, written by `build_dataset.py`). On a skewed
 backend can score high by doing the same, so a backend that does not beat `majority` there has
 learned nothing useful. The report also lists how the teacher's labels are distributed.
 
-Backends are compared only on changes that are complete, that every backend answered, and whose
-inputs no backend truncated. Changes with an incomplete diff or a truncated input are counted
-separately as requiring escalation and are never scored as classified. When the test set mixes
-AI-written and unmarked changes, the report also breaks the results down by author.
+Each backend is scored on every complete change it answered in full without truncating an
+input, and the report shows that coverage. A backend that covers fewer repositories, such as
+Jev behind its allowlist, therefore does not shrink the others' scores. A separate head-to-head
+table compares all backends on the changes they have in common. Changes with an incomplete diff
+or a truncated input are counted as requiring escalation and are never scored as classified.
+When the test set mixes marked and unmarked authorship, the report also breaks the results down
+by author.
 
-### Screening the teacher for potential bias
+### Second teacher
 
-An LLM judge can favour output from its own model family, and the first teacher is Claude. As a
-screen, label the AI-attributed changes and a group of unmarked ones again with an OpenAI model
-and compare:
+The second teacher is a model on your own hardware: Qwen served by vLLM on the Spark, reached
+over its OpenAI-compatible chat-completions API. It labels a random 20% of the changes plus the
+ones where Claude's label conflicts with an observed signal (changes requested, CI failed or a
+revert, on a change Claude rated as needing no human review or as risk 0 to 1). Nothing leaves
+your network, so this mode has no external gate; it still logs every case to a `.sent.jsonl`.
 
 ```bash
 pip install openai
-export OPENAI_API_KEY=...
-python label_second_teacher.py --allow-external openai --model <openai-model-id>
-python evaluate.py teachers claude=data/labels.jsonl openai=data/labels.openai.jsonl
+python label_second_teacher.py --base-url http://<spark>:8001/v1 --model qwen38-27b
+python evaluate.py teachers claude=data/labels.jsonl qwen=data/labels.second.jsonl
 ```
 
-If Claude answers lower than the second teacher more often on Claude-written changes than on
-unmarked ones, that is a reason to look closer. It is not proof of self-preference: the gap can
-come from ordinary model differences, and the two groups are not matched by repository, date,
-size or risk. Confirming it needs matched cases and independently reviewed labels.
+In the pilot, run it with `--limit 3` first to confirm the server accepts the strict JSON schema
+and returns the answer in `message.content`.
+
+This is a disagreement screen. It cannot establish bias or correctness: a gap can come from
+ordinary differences between the models. `--select authors` gives the older comparison by
+attributed author, and `--provider openai` uses a hosted model behind the external gate.
 
 ## First run: a pilot through every step
 
@@ -170,9 +190,12 @@ spark/run.sh dryrun
 TRAIN_ARGS="--epochs 1" NAME=pilot spark/run.sh train
 NAME=pilot spark/run.sh predict
 spark/run.sh predict english base
-python evaluate.py predict --backend jev --allow-external typesafe --out out/pred.jev.jsonl
-python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl jev=out/pred.jev.jsonl
+python evaluate.py report laya=out/pred.laya.jsonl base=out/pred.base.jsonl
+python label_second_teacher.py --base-url http://<spark>:8001/v1 --model qwen38-27b --limit 3
 ```
+
+`--limit` on the labeling step takes a seeded sample across repositories, so the token totals it
+prints are a fair basis for estimating the full run.
 
 Expect `laya-train` to warn that calibration was not fitted on so few rows. The pilot passes
 when every command finishes, the report lists a row per backend, and a few labels read against

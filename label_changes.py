@@ -22,12 +22,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 from common import (MAX_UNITS, UNIT_CHARS, allowed_repos, append_jsonl, build_units, load_questions,
-                    options, questions_sha, read_jsonl)
+                    options, questions_sha, read_jsonl, state_sha)
 
 MODEL = "claude-opus-5-5"
 BATCH_SIZE = 1000
@@ -95,6 +97,7 @@ def prompt(case: dict, units: list[dict], incomplete: list[str]) -> str:
               for r in o["reviews"]]
     parts += [f"  comment on {c['path']}:{c['line']} by {'human' if c['human'] else 'bot/author'}: {c['body']}"
               for c in o["review_comments"]]
+    parts += [f"  review-loop note from the description: {n}" for n in o.get("review_loop_notes", [])]
     if units:
         parts += ["", "=== change header the classifier sees on every unit ===", units[0]["header"].rstrip()]
     for u in units:
@@ -103,7 +106,8 @@ def prompt(case: dict, units: list[dict], incomplete: list[str]) -> str:
     return "\n".join(parts)
 
 
-def params(case: dict, questions: dict, model: str, unit_chars: int, max_units: int) -> dict:
+def params(case: dict, questions: dict, model: str, unit_chars: int, max_units: int,
+           effort: str = "high") -> dict:
     units, incomplete = build_units(case, unit_chars, max_units)
     return {
         "model": model,
@@ -111,7 +115,7 @@ def params(case: dict, questions: dict, model: str, unit_chars: int, max_units: 
         "thinking": {"type": "adaptive"},
         "system": SYSTEM.format(rubric=rubric(questions)),
         "messages": [{"role": "user", "content": prompt(case, units, incomplete)}],
-        "output_config": {"format": {"type": "json_schema", "schema": schema(questions)}},
+        "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema(questions)}},
     }
 
 
@@ -137,6 +141,7 @@ def parse(text: str, case: dict, questions: dict, unit_chars: int, max_units: in
     return {
         "change": conv(data["change"]),
         "units": {u["unit"]: by_unit[u["unit"]] for u in units},
+        "unit_sha": {u["unit"]: state_sha(u["state"]) for u in units},   # what the teacher was shown
         "rationale": data["rationale"],
         "units_complete": not incomplete,
         "incomplete_reasons": incomplete,
@@ -153,7 +158,12 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="data/labels.jsonl")
     ap.add_argument("--questions", default=None)
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--limit", type=int, default=0, help="label at most N new cases (0 = all)")
+    ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"],
+                    help="teacher effort; recorded with every label")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="label at most N new cases, sampled across repositories (0 = all)")
+    ap.add_argument("--max-attempts", type=int, default=2,
+                    help="stop retrying a case after this many recorded failures")
     ap.add_argument("--unit-chars", type=int, default=UNIT_CHARS)
     ap.add_argument("--max-units", type=int, default=MAX_UNITS)
     ap.add_argument("--allow-external", choices=["anthropic"],
@@ -209,6 +219,7 @@ def main(argv=None) -> int:
                 continue
             append_jsonl(args.out, {
                 "case_id": case_id, "label_source": "inferred", "teacher": args.model,
+                "teacher_effort": args.effort,
                 "questions_sha": questions_sha(questions),
                 "unit_chars": args.unit_chars, "max_units": args.max_units, **labels,
             })
@@ -230,7 +241,17 @@ def main(argv=None) -> int:
     if no_text:
         log(f"{len(no_text)} changes have no readable diff; not sent. They stay in the dataset as incomplete.")
     todo = [c for c in todo if c not in no_text]
+    # A case that fails the same way every time (for example by running out of output tokens)
+    # would be sent, and billed, on every run.
+    failures = Counter(e["case_id"] for e in read_jsonl(errors_path))
+    given_up = [c for c in todo if failures[c["case_id"]] >= args.max_attempts]
+    if given_up:
+        log(f"{len(given_up)} cases failed {args.max_attempts}+ times and are not retried (see {errors_path}).")
+    todo = [c for c in todo if c not in given_up]
     if args.limit:
+        # File order is repository order, so the first N would all come from one or two
+        # repositories and give a misleading cost estimate. Take a seeded sample instead.
+        random.Random(0).shuffle(todo)
         todo = todo[:args.limit]
     log(f"{len(done)} cases already labelled, {len(todo)} to label with {args.model}")
 
@@ -239,7 +260,7 @@ def main(argv=None) -> int:
         batch = client.messages.batches.create(requests=[
             Request(custom_id=cid(c["case_id"]),
                     params=MessageCreateParamsNonStreaming(
-                        **params(c, questions, args.model, args.unit_chars, args.max_units)))
+                        **params(c, questions, args.model, args.unit_chars, args.max_units, args.effort)))
             for c in chunk])
         pending_path.write_text(json.dumps([batch.id]))
         for c in chunk:   # audit trail of what left this machine

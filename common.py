@@ -169,8 +169,9 @@ def change_header(case: dict) -> str:
     strata = Counter(s for f in files for s in file_strata(f["path"]))
     dirs = Counter(f["path"].split("/")[0] if "/" in f["path"] else "." for f in files)
     unread = len(unread_files(case))
+    # The repository name is left out on purpose: it would let the classifier learn a prior per
+    # repository instead of reading the change.
     head = (
-        f"Repository: {case['repo']}\n"
         f"Change: {' '.join((case['title'] or '').split())[:150]}\n"
         f"Description: {' '.join((case.get('body') or '').split())[:300]}\n"
         f"Summary: {len(files)} files ({status['added']} added, {status['deleted']} deleted, "
@@ -331,3 +332,38 @@ def questions_sha(questions: dict) -> str:
     """Fingerprint of a question set. Labels made under one set are not valid under another."""
     import hashlib
     return hashlib.sha256(json.dumps(questions, sort_keys=False, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def state_sha(state: str) -> str:
+    """Fingerprint of one unit's input, stored with its label so later drift is detected."""
+    import hashlib
+    return hashlib.sha256(state.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------- review-loop text ----------
+# Agent-written descriptions often record how review went ("DeepSeek: PASS, notes only",
+# "second and third review rounds"). That is hindsight, so such lines are kept out of the
+# prediction view. A bare tool name is not enough: "Codex" can be the subject of a change.
+
+_ROUND = re.compile(
+    r"\breview[- ](rounds?|loops?)\b|\brounds? \d|\b(first|second|third|fourth|fifth|two|three|four|five|\d+) "
+    r"(review )?rounds?\b|\b(second|third|re)[- ]review\b", re.I)
+_REVIEWER = re.compile(r"\bdeepseek\b|\bpeer[- ]review(er)?\b|\breviewer\b|\bcodex\s*(:|review|gate|round)", re.I)
+_RESULT = re.compile(
+    r"\b(pass(ed|es)?|fail(ed|s)?|inconclusive|verdict|blocking|warnings?|notes? only|findings?|"
+    r"applied|addressed|resolved|approved|rejected)\b", re.I)
+
+
+def strip_review_loop(text: str | None) -> tuple[str, list[str]]:
+    """(text without review-outcome lines, the lines removed).
+
+    A line goes when it mentions review rounds or a review loop, or names a reviewer together
+    with a result.
+    """
+    kept, removed = [], []
+    for line in (text or "").splitlines():
+        if _ROUND.search(line) or (_REVIEWER.search(line) and _RESULT.search(line)):
+            removed.append(line.strip())
+        else:
+            kept.append(line)
+    return "\n".join(kept).strip(), removed

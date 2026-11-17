@@ -26,7 +26,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from common import (MAX_UNITS, UNIT_CHARS, build_units, load_questions, options, questions_sha, read_jsonl, unread_files,
+from common import (MAX_UNITS, UNIT_CHARS, build_units, load_questions, options, questions_sha, read_jsonl, state_sha, strip_review_loop,
+                    unread_files,
                     write_jsonl)
 
 
@@ -49,6 +50,10 @@ def split(cases: list[dict], val_frac: float, test_frac: float, holdout: set[str
     return train, val, test
 
 
+class StaleLabel(Exception):
+    pass
+
+
 def majority(values: list, q: dict):
     """The most common answer; ties go to the lower option. None when there are no values."""
     counts = Counter(values)
@@ -61,6 +66,12 @@ def majority(values: list, q: dict):
 
 def unit_rows(case: dict, label: dict, questions: dict) -> list[dict]:
     units, _ = build_units(case, label["unit_chars"], label["max_units"])
+    # The teacher labelled a specific input. If the header or the chunking has changed since,
+    # the rebuilt unit is a different input and the label no longer belongs to it.
+    shas = label.get("unit_sha")
+    if label["units"] and (shas is None or any(shas.get(u["unit"]) != state_sha(u["state"])
+                                               for u in units if u["unit"] in label["units"])):
+        raise StaleLabel(case["case_id"])
     return [{
         "id": f"{case['case_id']}::{u['unit']}", "case_id": case["case_id"],
         "state": u["state"], "questions": questions, "expected": label["units"][u["unit"]],
@@ -107,9 +118,22 @@ def main(argv=None) -> int:
     train, val, test = split(cases, args.val_frac, args.test_frac, set(args.holdout_repo))
 
     out = Path(args.out)
-    train_rows = [r for c in train for r in unit_rows(c, labels[c["case_id"]], questions)]
-    val_rows = [r for c in val for r in unit_rows(c, labels[c["case_id"]], questions)]
-    test_rows = [r for c in test for r in unit_rows(c, labels[c["case_id"]], questions)]
+    drifted = []
+
+    def rows_of(group):
+        rows = []
+        for c in group:
+            try:
+                rows += unit_rows(c, labels[c["case_id"]], questions)
+            except StaleLabel:
+                drifted.append(c["case_id"])
+        return rows
+
+    train_rows, val_rows, test_rows = rows_of(train), rows_of(val), rows_of(test)
+    if drifted:
+        sys.exit(f"{len(drifted)} labelled changes no longer produce the units the teacher saw "
+                 f"(first: {drifted[0]}).\nThe header or unit code, or cases.jsonl, changed after "
+                 "labelling. Label those changes again, or restore the code the labels were made with.")
     write_jsonl(out / "train.jsonl", train_rows)
     write_jsonl(out / "val.jsonl", val_rows)
     write_jsonl(out / "test.jsonl", test_rows)
@@ -136,6 +160,15 @@ def main(argv=None) -> int:
     print(f"test:  {len(test)} changes, {len(test_rows)} units "
           f"({sum(not labels[c['case_id']]['units_complete'] for c in test)} incomplete, "
           f"{sum(not labels[c['case_id']]['change'] for c in test)} of them with no readable diff)")
+    leaked = sum(bool(strip_review_loop(r["state"].split("\nFiles:\n")[0])[1])
+                 for r in train_rows + val_rows + test_rows)
+    if leaked:
+        print(f"WARNING: {leaked} unit headers still mention review rounds or reviewer results.")
+    print("Effective training size is changes, not units: units of one change share a header.")
+    for qid, q in questions.items():
+        per = Counter(ch[qid] for ch in train_changes)
+        print(f"  {qid}: train changes per answer {{{', '.join(f'{o}: {per[o]}' for o in options(q))}}}; "
+              f"rarest answer has {min(per[o] for o in options(q))}")
     for qid in questions:
         tr = Counter(str(r["expected"][qid]) for r in train_rows)
         te = Counter(str(labels[c["case_id"]]["change"][qid]) for c in test if labels[c["case_id"]]["change"])

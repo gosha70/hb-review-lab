@@ -6,6 +6,7 @@ subject: branch claude/elegant-archimedes-0b8l9f at c3b35ac, and the pilot runbo
 companion: 2026-11-16-code-review-addendum.md (owner decisions and data the pipeline doesn't use yet)
 verdict: changes requested before the pilot
 rereviewed: 99cdcd9 (2026-11-16): blockers fixed; W1 partly fixed; W2–W4 open
+rereviewed_2: b847917 (2026-11-16): W1–W4 fixed; new W2b and W3b open; owner keeps criticality
 ---
 
 # Code review: pipeline and pilot runbook at `c3b35ac`
@@ -28,6 +29,100 @@ Severities follow the review-loop scale (blocking / warning / note). File:line r
 - Laya's container entrypoint `exec`s its arguments, so the `spark/run.sh` invocations are sound.
 - Read-only GitHub checks of the owner's repositories and of django/django and grafana/grafana
   produced the numbers below.
+
+## Re-review of `b847917` (latest)
+
+What I checked:
+
+- Read the whole diff; 18 of 18 tests pass.
+- Ran `strip_review_loop()` over 238 real merged PR descriptions and titles from wiki-studio,
+  code-copilot-team, ai-atlas and memkernel, and over probe sentences.
+- Read issues #5–#8.
+
+**Verdict.** Everything this review required before labelling is addressed, and the issues reflect
+the addendum faithfully. Before the full labelling run, two things remain:
+
+- **W2b:** the stripper removes too much.
+- **W3b:** the disagreement signal is nearly empty on this data.
+
+The owner has decided to keep `criticality` (see below).
+
+| Item | Status | Notes |
+|---|---|---|
+| W1 drift guard | Fixed | Each label stores a `unit_sha` per unit, `build_dataset.py` refuses any mismatch, and `questions_sha` is kept. |
+| W2 description leak | Fixed, but it over-strips | Leaks into the unit header fell from 8 to 1 of 238. Some removed lines describe the change itself (W2b). |
+| W3 second teacher | Fixed | Local provider by default; a random 20% plus disagreements; the hosted mode stays behind the gate; the endpoint is logged. The disagreement signal is weak here (W3b). |
+| W4 Jev scoring | Fixed | Each backend is scored on its own changes, with coverage. A head-to-head table (majority included) uses the common set. Jev is out of the pilot, and the example allowlist no longer names Django. |
+| B1 gap | Fixed | Unfinished repositories are logged. |
+| N1, N2, N5, N6, N7 | Fixed | Seeded `--limit` sample; per-answer counts; effort set inside `output_config` (the correct place) and recorded; at most 2 attempts per case; repository name out of the header. |
+| N3, N4 | Filed in #8 | Fine to defer. |
+
+### W2b. The stripper removes descriptions of the change, including security evidence (warning)
+
+- **Where:** `common.py` `_ROUND`, `_REVIEWER`, `_RESULT` and `strip_review_loop()`.
+- **Evidence:**
+  - It removed 120 lines from 75 of the 238 descriptions.
+  - 8 of 12 sampled code-copilot-team lines describe the change rather than report a review
+    outcome. #418 is one: "A gating reviewer's finding that a named test fails counted
+    toward the breaker…" (the bug being fixed). #425 and #433 are others.
+  - code-copilot-team, with 320 PRs, is itself review tooling, so its subject matter matches the
+    patterns.
+- **Probes that should be kept but are stripped:**
+  - "Hash passwords with bcrypt at 12 rounds."
+  - "Derive keys with PBKDF2, 600000 rounds."
+  - "Retry the upload up to 3 rounds before it fails."
+  - "Round 2 of the migration moves the remaining tables."
+  - "Add a reviewer field; approved requests now show who signed off."
+
+  The two crypto lines are exactly the security evidence the classifier needs.
+- **Fix:**
+  - Count a round only when "review" is part of the phrase ("second review round", "review rounds",
+    "rounds of review"). Drop the generic `\brounds? \d` and `\b\d+ rounds?\b` alternatives, and the
+    bare `\breviewer\b`.
+  - Require the reviewer and the result to sit together: "DeepSeek: PASS", "Codex review: 2
+    findings", "the second review found".
+  - Drop whole sections under a heading such as "## Review rounds".
+  - Add the probes above as must-keep tests, and the lines from #126, #127, #132, #443 and #449 as
+    must-strip tests.
+  - Do it before the full labelling run. A new stripper means re-scraping, and the drift guard will
+    then refuse labels made from the old headers.
+
+### W3b. The disagreement signal is nearly empty on this data (warning)
+
+- **Where:** `label_second_teacher.py` `conflicts()` uses `changes_requested`, `ci_failed` and
+  `reverted`. `ci_failed` reads only the final head commit (`repo_audit.py:75` and `:308`).
+- **On the owner's repositories:**
+  - Changes were requested on 3 PRs, and nothing was reverted.
+  - Final-state CI failures cluster in mileroot and hookatlas, whose CI stays red: 56 and 13 PRs
+    with failures, 2 recovered in each. That's noise.
+- **The strongest observed signal here is CI going red, then green before merge:** 116 of 828
+  human PRs.
+  - Capturing it is a single change at `repo_audit.py:75`: `commits(last:1)` becomes
+    `commits(first:100){…statusCheckRollup{state}}`, which yields `observed.ci_red_then_green`.
+  - #8 files it as a follow-up. Do it before the full labelling run instead: the outcome view is
+    what the teacher reads, so labels made without it miss the most common observed signal here.
+
+### The builder's decisions
+
+- **Teacher effort `high`.** Keep it for now, but in the pilot also label the same 20 cases at
+  `medium`. The agreement between the two doubles as a teacher self-agreement check, and the token
+  totals show the cost difference. If the change-level answers agree on at least 90% of cases, use
+  `medium` for the full run.
+- **One-directional disagreement.** Agree. An observed problem on a change rated low is evidence
+  of an under-call. A clean outcome on a change rated high is not evidence of an over-call.
+- **Stripping review-round lines without a result word.** Agreed in principle, provided the
+  pattern requires "review" (W2b).
+
+### `criticality`: owner decision
+
+**Owner decision (2026-11-16): keep `criticality` in `questions.json`.** It is settled; label with
+it.
+
+### Merge readiness
+
+- **Open the pull request now,** so this review is attached to it.
+- **Before merging,** land W2b and, preferably, W3b. Both change what the teacher sees.
+- **Then run the pilot from `main`.**
 
 ## Re-review of `99cdcd9`
 

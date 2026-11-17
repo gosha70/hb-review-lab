@@ -440,25 +440,54 @@ class PipelineTest(unittest.TestCase):
                 "changes_requested": False, "ci_failed": False, "reverted": False, **obs}}}
         cases = [case(i) for i in range(20)]
         cases[3] = case(3, changes_requested=True)      # trouble, and the first teacher said "none"
-        cases[4] = case(4, ci_failed=True)              # trouble, but the first teacher already said "required"
+        cases[4] = case(4, ci_red_then_green=True)      # trouble, but the first teacher already said "required"
+        cases[5] = case(5, ci_red_then_green=True)      # CI failed then was fixed; first teacher said "none"
+        cases[6] = case(6, ci_failed=True)              # CI red at the end: not a signal on its own
         first = {c["case_id"]: {"change": {"human_review": "none", "risk_score": 2}} for c in cases}
         first["c04"] = {"change": {"human_review": "required", "risk_score": 3}}
         sel = label_second_teacher.select
-        self.assertEqual([c["case_id"] for c in sel(cases, first, ["disagreements"])], ["c03"])
+        self.assertEqual([c["case_id"] for c in sel(cases, first, ["disagreements"])], ["c03", "c05"])
         rnd = [c["case_id"] for c in sel(cases, first, ["random"], fraction=0.2, seed=1)]
         self.assertEqual(len(rnd), 4)
         self.assertEqual(rnd, [c["case_id"] for c in sel(cases, first, ["random"], fraction=0.2, seed=1)])  # seeded
         both = {c["case_id"] for c in sel(cases, first, ["random", "disagreements"], fraction=0.2, seed=1)}
-        self.assertEqual(both, set(rnd) | {"c03"})
+        self.assertEqual(both, set(rnd) | {"c03", "c05"})
 
     def test_review_loop_lines(self):
         strip = common.strip_review_loop
-        text = ("Adds the session store.\nDeepSeek, two rounds on the spec: round 1's points applied\n"
-                "Second and third review rounds\nCodex: PASS\nAdd Codex evaluator harness and fix parser")
+        must_strip = [
+            "DeepSeek, two rounds on the spec: round 1's points applied; round 2 one warning",   # memkernel #126
+            "DeepSeek: PASS, notes only.",                                                       # memkernel #132
+            "DeepSeek on A1 and on the second-review fixes: PASS, notes only. DeepSeek on the build: PASS",  # #127
+            "second and third review rounds",                                                    # memkernel #124
+            "four review rounds on #124",
+            "Codex: PASS",
+            "Codex review: 2 findings, both fixed",
+            "The second review found a missing null check.",
+            "Verdict: FAIL",
+            "3 rounds of review before merge",
+        ]
+        must_keep = [
+            "Hash passwords with bcrypt at 12 rounds.",
+            "Derive keys with PBKDF2, 600000 rounds.",
+            "Retry the upload up to 3 rounds before it fails.",
+            "Round 2 of the migration moves the remaining tables.",
+            "Add a reviewer field; approved requests now show who signed off.",
+            "A gating reviewer's finding that a named test fails counted toward the breaker.",
+            "Add Codex evaluator harness and fix parser",
+            "Add the review-loop state file and a command to resume a review round",
+            "Adds a reviewer assignment endpoint",
+            "Tests pass locally; fail fast when the token is missing.",
+        ]
+        for line in must_strip:
+            self.assertEqual(strip(line), ("", [line]), line)
+        for line in must_keep:
+            self.assertEqual(strip(line), (line, []), line)
+        # a whole section under a review heading goes, up to the next heading of that level
+        text = "Adds the session store.\n\n## Review rounds\n- first pass: two notes\n- all applied\n\n## Testing\nUnit tests added."
         clean, removed = strip(text)
-        self.assertEqual(clean, "Adds the session store.\nAdd Codex evaluator harness and fix parser")
-        self.assertEqual(len(removed), 3)
-        self.assertEqual(strip("Adds a reviewer assignment endpoint"), ("Adds a reviewer assignment endpoint", []))
+        self.assertEqual(clean, "Adds the session store.\n\n## Testing\nUnit tests added.")
+        self.assertEqual(removed, ["## Review rounds", "- first pass: two notes", "- all applied"])
         self.assertEqual(strip(None), ("", []))
 
     def test_binary_only_change_is_kept_and_escalated(self):

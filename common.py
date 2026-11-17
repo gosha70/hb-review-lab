@@ -343,27 +343,56 @@ def state_sha(state: str) -> str:
 # ---------- review-loop text ----------
 # Agent-written descriptions often record how review went ("DeepSeek: PASS, notes only",
 # "second and third review rounds"). That is hindsight, so such lines are kept out of the
-# prediction view. A bare tool name is not enough: "Codex" can be the subject of a change.
+# prediction view.
+#
+# The patterns are deliberately narrow. Some repositories are about review tooling, and plain
+# words such as "reviewer", "round" or "finding" describe the change itself there; "12 rounds"
+# of a hash is security evidence. So a round counts only as a counted *review* round, and a
+# reviewer counts only when a result is attached to it.
 
-_ROUND = re.compile(
-    r"\breview[- ](rounds?|loops?)\b|\brounds? \d|\b(first|second|third|fourth|fifth|two|three|four|five|\d+) "
-    r"(review )?rounds?\b|\b(second|third|re)[- ]review\b", re.I)
-_REVIEWER = re.compile(r"\bdeepseek\b|\bpeer[- ]review(er)?\b|\breviewer\b|\bcodex\s*(:|review|gate|round)", re.I)
-_RESULT = re.compile(
-    r"\b(pass(ed|es)?|fail(ed|s)?|inconclusive|verdict|blocking|warnings?|notes? only|findings?|"
-    r"applied|addressed|resolved|approved|rejected)\b", re.I)
+_COUNT = r"(?:first|second|third|fourth|fifth|one|two|three|four|five|six|\d+)"
+_NAMED = r"(?:deepseek|codex)"
+_VERDICT = r"(?:pass(?:ed)?|fail(?:ed)?|inconclusive)"
+_REVIEW_OUTCOME = re.compile("|".join([
+    # counted review rounds: "second and third review rounds", "four review rounds", "3 rounds of review"
+    rf"\b{_COUNT}(?:\s+and\s+{_COUNT})?\s+(?:peer[- ])?review\s+rounds?\b",
+    rf"\b{_COUNT}\s+rounds?\s+of\s+(?:peer[- ])?review\b",
+    r"\breview\s+round\s+\d",
+    # a named reviewer with a verdict: "DeepSeek: PASS", "DeepSeek on the build: PASS"
+    rf"\b{_NAMED}\b[^.\n]{{0,60}}?:\s*{_VERDICT}\b",
+    # a named reviewer with its rounds: "DeepSeek, two rounds on the spec"
+    rf"\b{_NAMED}\b[^.\n]{{0,30}}?\brounds?\b",
+    # a review with a tally: "Codex review: 2 findings", "peer review: no findings"
+    rf"\b(?:{_NAMED}|peer)[- ]review\b[^.\n]{{0,20}}?:\s*(?:\d+|no)\s+(?:findings?|warnings?|notes?|blocking)",
+    # an ordinal review with what it did: "the second review found"
+    r"\b(?:first|second|third|fourth|re)[- ]review\s+(?:found|passed|failed|flagged|raised)\b",
+    # a bare verdict: "verdict: PASS", "PASS, notes only"
+    rf"\bverdict\s*:\s*{_VERDICT}\b",
+    r"\b(?:PASS|FAIL), notes only\b",
+]), re.I)
+_REVIEW_HEADING = re.compile(r"^(#{1,6})\s*(?:peer[- ])?review[- ](?:rounds?|loop|results?|verdicts?|history)\b", re.I)
+_HEADING = re.compile(r"^(#{1,6})\s")
 
 
 def strip_review_loop(text: str | None) -> tuple[str, list[str]]:
     """(text without review-outcome lines, the lines removed).
 
-    A line goes when it mentions review rounds or a review loop, or names a reviewer together
-    with a result.
+    Removes lines that report a counted review round or a reviewer's result, and whole sections
+    under a heading such as "## Review rounds". Lines that merely mention a reviewer, a round or
+    a finding are kept: they may describe the change.
     """
     kept, removed = [], []
+    section = 0     # heading level of a review section being dropped; 0 when not in one
     for line in (text or "").splitlines():
-        if _ROUND.search(line) or (_REVIEWER.search(line) and _RESULT.search(line)):
-            removed.append(line.strip())
+        h = _HEADING.match(line)
+        if section and h and len(h.group(1)) <= section:
+            section = 0
+        m = _REVIEW_HEADING.match(line)
+        if m:
+            section = len(m.group(1))
+        if section or _REVIEW_OUTCOME.search(line):
+            if line.strip():
+                removed.append(line.strip())
         else:
             kept.append(line)
     return "\n".join(kept).strip(), removed

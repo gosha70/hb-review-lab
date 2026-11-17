@@ -8,8 +8,9 @@ schema as the first teacher (Claude). Nothing leaves your network in this mode.
 Which changes it labels (--select, comma-separated):
   random         a seeded random --fraction of the labelled changes (default 0.2)
   disagreements  changes where the first teacher's label conflicts with an observed signal:
-                 changes were requested, CI failed, or the change was reverted, and yet the
-                 first teacher said no human review is needed or scored the risk 0 or 1
+                 changes were requested, CI failed and was fixed before merge, or the change
+                 was reverted, and yet the first teacher said no human review is needed or
+                 scored the risk 0 or 1
   authors        every change attributed to one AI agent plus the newest --control unmarked ones
 
     pip install openai
@@ -41,7 +42,9 @@ AGENTS_EXCLUDED = ("unmarked", "mixed", "unknown")
 def conflicts(case: dict, label: dict) -> bool:
     """An observed sign of trouble, on a change the first teacher rated as needing little."""
     o = case["outcome"]["observed"]
-    trouble = o.get("changes_requested") or o.get("ci_failed") or o.get("reverted")
+    # CI that is red on the final commit is left out: in a repository whose CI stays red it says
+    # nothing about the change. CI that failed and was then fixed before merge does.
+    trouble = o.get("changes_requested") or o.get("ci_red_then_green") or o.get("reverted")
     ch = label["change"]
     return bool(trouble) and (ch.get("human_review") == "none" or ch.get("risk_score", 9) <= 1)
 

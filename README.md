@@ -77,7 +77,9 @@ How the data is shaped:
   the affected labels instead of training on answers to different inputs. Settle
   `questions.json` before the first labeling run.
 - Lines in a description or commit message that report how review went ("DeepSeek: PASS, notes
-  only", "second and third review rounds") are hindsight. They are removed from the prediction
+  only", "second and third review rounds") are hindsight. Only counted review rounds and a
+  reviewer's stated result are matched; lines that merely mention a reviewer, a round or a
+  finding are kept, because they may describe the change ("bcrypt at 12 rounds"). They are removed from the prediction
   view (`body_source: stripped_review_loop`) and kept in the outcome view, where the teacher
   sees them. `build_dataset.py` warns if any unit header still contains one.
 - The teacher runs at `--effort high` by default; the model and effort are recorded with every
@@ -156,8 +158,10 @@ by author.
 
 The second teacher is a model on your own hardware: Qwen served by vLLM on the Spark, reached
 over its OpenAI-compatible chat-completions API. It labels a random 20% of the changes plus the
-ones where Claude's label conflicts with an observed signal (changes requested, CI failed or a
-revert, on a change Claude rated as needing no human review or as risk 0 to 1). Nothing leaves
+ones where Claude's label conflicts with an observed signal (changes requested, CI that failed
+and was fixed before merge, or a revert, on a change Claude rated as needing no human review or
+as risk 0 to 1). CI that is still red on the final commit is not used: in a repository whose CI
+stays red it says nothing about the change. Nothing leaves
 your network, so this mode has no external gate; it still logs every case to a `.sent.jsonl`.
 
 ```bash
@@ -196,6 +200,17 @@ python label_second_teacher.py --base-url http://<spark>:8001/v1 --model qwen38-
 
 `--limit` on the labeling step takes a seeded sample across repositories, so the token totals it
 prints are a fair basis for estimating the full run.
+
+The teacher runs at `--effort high`. To see whether `medium` would do, label the same 20 cases
+at `medium` into a second file and compare; the two runs print their token totals:
+
+```bash
+python label_changes.py --allow-external anthropic --limit 20 --effort medium --out data/labels.medium.jsonl
+python evaluate.py teachers high=data/labels.jsonl medium=data/labels.medium.jsonl
+```
+
+If the two agree on at least 90% of the change-level answers, use `medium` for the full run.
+The comparison is also a check on how repeatable the teacher is.
 
 Expect `laya-train` to warn that calibration was not fitted on so few rows. The pilot passes
 when every command finishes, the report lists a row per backend, and a few labels read against

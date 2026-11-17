@@ -15,7 +15,8 @@ REVERTED = "a" * 40
 RL = {"remaining": 5000, "resetAt": "2030-01-01T00:00:00Z"}
 
 
-def pr(number, title, author="alice", reviews=(), paths=("src/app.py",), ci="SUCCESS", merge=None):
+def pr(number, title, author="alice", reviews=(), paths=("src/app.py",), ci="SUCCESS", merge=None,
+       earlier_ci=()):
     return {
         "number": number, "title": title, "createdAt": f"2026-01-{number:02d}T00:00:00Z",
         "mergedAt": None, "state": "MERGED", "additions": 10, "deletions": 2, "changedFiles": len(paths),
@@ -27,6 +28,8 @@ def pr(number, title, author="alice", reviews=(), paths=("src/app.py",), ci="SUC
             for who, t, s, n in reviews]},
         "files": {"nodes": [{"path": p} for p in paths]},
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": ci} if ci else None}}]},
+        "history": {"nodes": [{"commit": {"statusCheckRollup": {"state": st} if st else None}}
+                              for st in (*earlier_ci, ci)]},
     }
 
 
@@ -43,7 +46,8 @@ def commit(oid, headline, body="", pr_number=None, parents=1, ci=None):
 PR_PAGES = [
     [pr(1, "Add login", reviews=[("bob", "User", "CHANGES_REQUESTED", 3)], paths=("src/auth/login.py",),
         merge=REVERTED),
-     pr(2, "Tidy", reviews=[("alice", "User", "COMMENTED", 1), ("copilot", "Bot", "COMMENTED", 2)])],
+     pr(2, "Tidy", reviews=[("alice", "User", "COMMENTED", 1), ("copilot", "Bot", "COMMENTED", 2)],
+        earlier_ci=("FAILURE", None))],
     [pr(3, "Bump deps", author="dependabot[bot]", paths=("package.json",)),
      pr(4, "Fix crash", ci="FAILURE")],
 ]
@@ -147,6 +151,7 @@ class AuditTest(unittest.TestCase):
             self.assertEqual(r["prs_changes_requested"], "1")
             self.assertEqual(r["prs_bot_review_only"], "1")
             self.assertEqual(r["changes_ci_failed"], "1")
+            self.assertEqual(r["prs_ci_red_then_green"], "1")   # PR 2 failed, then passed; PR 4 is still red
             self.assertEqual(r["direct_commits"], "2")          # merge + PR commit excluded
             self.assertEqual(r["changes_reverted"], "1")
             self.assertEqual(r["reverts"], "1")
@@ -154,11 +159,13 @@ class AuditTest(unittest.TestCase):
             self.assertEqual(r["stratum_data_migration"], "1")  # from REST file lookup
             self.assertEqual(r["stratum_dependencies"], "0")    # bot-authored excluded
             self.assertEqual(r["candidates"], "5")
-            self.assertEqual(r["candidates_with_outcome_evidence"], "2")
+            self.assertEqual(r["candidates_with_outcome_evidence"], "3")
             self.assertEqual(rows["me/empty"]["commits_default_branch"], "0")
             cands = [json.loads(l) for l in open(f"{out}/candidates.jsonl")]
             pr1 = next(c for c in cands if c["id"] == 1)
             self.assertTrue(pr1["observed"]["reverted"])
+            by_id = {c["id"]: c["observed"] for c in cands if c["kind"] == "pr"}
+            self.assertEqual([by_id[n]["ci_red_then_green"] for n in (1, 2, 4)], [False, True, False])
             self.assertIn("me/gone", open(f"{out}/summary.md").read())
 
     def test_second_run_for_other_repos_keeps_the_first_runs_candidates(self):
